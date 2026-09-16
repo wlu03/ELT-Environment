@@ -8,7 +8,7 @@ Tinker/GRPO orchestration for the two-stage ELT tasks produced by
 > yet. This directory must not be described as a runnable trainer until the
 > pilot exit criteria in [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md) pass.
 
-## Core contract
+# Rollout
 
 One rollout is one parent task and one continuous attempt:
 1. public task
