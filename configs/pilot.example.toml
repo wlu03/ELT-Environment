@@ -1,0 +1,54 @@
+# This file documents the intended configuration surface. The CLI that loads it
+# is a build-plan item and does not exist yet.
+
+[taskgen]
+# Use a reviewed, immutable installation/digest in training. A mutable sibling
+# checkout is acceptable only while developing the adapter.
+root = "../ELT-taskgen"
+release_dir = "/absolute/path/to/a/verified/schema-3/release"
+require_combined_layout = true
+require_accepted_tasks = true
+verify_checksums = true
+
+[corpus]
+# Select IDs and family/split metadata from release_manifest.json. Never infer a
+# training corpus by walking runs/*/tasks or public/ directories.
+train_split = "train"
+eval_split = "validation"
+family_disjoint = true
+shuffle_seed = 20260906
+
+[environment]
+mode = "workspace_artifact"
+attempts_root = ".state/attempts"
+max_output_tokens = 16384
+grader_deadline_seconds = 420
+max_artifact_bytes = 16777216
+max_artifact_files = 512
+w_t = 1.0
+
+[grpo]
+group_size = 4
+groups_per_batch = 2
+max_whole_group_attempts = 4
+max_concurrent_groups = 1
+synchronous = true
+remove_constant_reward_groups = false
+
+[tinker]
+model_name = "replace-with-an-admitted-tinker-model"
+project = "elt-environment-pilot"
+# TINKER_API_KEY is injected through the process environment.
+
+[checkpoint]
+directory = ".state/checkpoints"
+every_steps = 10
+save_optimizer_state = true
+save_sampler_state = true
+save_dataset_cursor = true
+
+[telemetry]
+directory = ".state/logs"
+policy_visible_errors = "stable_codes_only"
+record_private_grader_details = false
+
