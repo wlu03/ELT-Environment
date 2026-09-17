@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = { text = "Proprietary" }
 dependencies = [
+  "elt-taskgen",
   "tinker==0.27.1",
   "tinker-cookbook==0.5.7",
 ]
@@ -28,3 +29,17 @@ elt_environment = ["py.typed"]
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+
+[tool.uv]
+# The scorer's content hashes are only validated byte-identical across the
+# sqlglot versions ELT-taskgen pins. Keep this interpreter on the exact
+# version in ELT-taskgen/uv.lock so a rollout scored here and a task scored
+# there cannot disagree.
+constraint-dependencies = [
+  "sqlglot==30.16.0",
+  "pydantic==2.13.4",
+  "typing-inspection==0.4.3",
+]
+
+[tool.uv.sources]
+elt-taskgen = { path = "../ELT-taskgen", editable = true }
