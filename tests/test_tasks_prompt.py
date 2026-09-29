@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import csv
+import io
+import re
+import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
+import hcl2
 import yaml
+from elt_taskgen.export.eltbench import public_column_description
 
 from elt_environment.artifact import format_artifact, parse_artifact
 from elt_environment.prompt import (
@@ -55,6 +62,108 @@ class RedactionTests(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(BundleRedactionError):
                 redact_credentials(text)
 
+
+README_TABLES = """## Source tables
+
+### orders  (source backend: postgres)
+Source table orders.
+
+- `id`: bigint NOT NULL — Order id.
+- `note`: text NULL — Free text.
+- primary key: id
+
+### items  (source backend: files)
+- `id`: bigint NOT NULL — Item id.
+
+### Relationships
+
+- `sku`: text NULL — Listed under another heading, so not a column of items.
+"""
+SCHEMA_HEADER = "column_name,column_description\n"
+README_COLUMN = re.compile(
+    r"- `(?P<name>[^`]+)`: \S+ (?P<null>NULL|NOT NULL) —"
+    r"(?: (?P<description>.*?))?(?: one of: (?P<values>.*)\.)?"
+)
+
+
+class BundleSelectionTests(unittest.TestCase):
+    def test_readme_is_the_only_document_and_repeated_schemas_are_left_out(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            task = TaskRef(Path(root), "t", "f", "snowflake")
+            files = {
+                "documentation/README.md": README_TABLES,
+                "documentation/source_postgres.md": "reference",
+                "documentation/destination_snowflake.md": "reference",
+                "config.yaml": "snowflake:\n  config:\n    database: d\n",
+                "schemas/orders.csv": (
+                    SCHEMA_HEADER + "id,Order id.\nnote,Free text. may be NULL.\n"
+                ),
+                "schemas/items.csv": SCHEMA_HEADER + "id,Item id.\nsku,Stock unit.\n",
+                "schemas/customers.csv": SCHEMA_HEADER + "id,Customer id.\n",
+            }
+            for relative, content in files.items():
+                (task.public_dir / relative).parent.mkdir(parents=True, exist_ok=True)
+                (task.public_dir / relative).write_text(content, encoding="utf-8")
+            paths = [path for path, _ in bundle_files(task)]
+        self.assertEqual(
+            paths,
+            [
+                "documentation/README.md",
+                "config.yaml",
+                "schemas/customers.csv",
+                "schemas/items.csv",
+            ],
+        )
+
+
+def _schema_rows_from_readme(readme: str, table: str) -> list[list[str]] | None:
+    """Rebuild the rows of ``schemas/<table>.csv`` from the README the way taskgen writes them."""
+
+    section = re.search(
+        rf"^### {re.escape(table)}  \(source backend: [^)]+\)\n(.*?)(?=^#|\Z)",
+        readme,
+        re.MULTILINE | re.DOTALL,
+    )
+    if section is None:
+        return None
+    rows = [SCHEMA_HEADER.strip().split(",")]
+    for line in section[1].splitlines():
+        match = README_COLUMN.fullmatch(line)
+        if match:
+            column = SimpleNamespace(
+                description=match["description"] or "",
+                enum_values=match["values"].split(", ") if match["values"] else [],
+                nullable=match["null"] == "NULL",
+            )
+            rows.append([match["name"], public_column_description(column)])
+    return rows
+
+
+def _attribute_paths(main_tf: str) -> set[tuple[str, ...]]:
+    """Return every provider and resource attribute path in ``main_tf``, without values."""
+
+    paths: set[tuple[str, ...]] = set()
+
+    def walk(node: object, prefix: tuple[str, ...]) -> None:
+        if isinstance(node, dict):
+            for key, value in node.items():
+                paths.add((*prefix, key))
+                walk(value, (*prefix, key))
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, prefix)
+
+    document = hcl2.loads(main_tf)
+    for block in document.get("resource", []):
+        for kind, named in block.items():
+            for body in named.values():
+                walk(body, ("resource", kind))
+    for block in document.get("provider", []):
+        for kind, body in block.items():
+            walk(body, ("provider", kind))
+    return paths
+
+
 TASKGEN = Path(__file__).resolve().parents[2] / "ELT-taskgen"
 RELEASES = TASKGEN / "runs" / "batch50c_20260923" / "workspace" / "releases"
 FIXTURE = TASKGEN / "tests" / "fixtures" / "semantic_gate" / "release"
@@ -104,21 +213,35 @@ class ReleaseAndPromptTests(unittest.TestCase):
         self.assertEqual(self.task.family, "dlt__workable")
         self.assertEqual(self.task.destination, "snowflake")
 
-    def test_bundle_reads_only_public_files_and_leaves_out_other_destinations(self) -> None:
-        paths = [path for path, _ in bundle_files(self.task)]
-        self.assertEqual(paths[:3], ["documentation/README.md", "config.yaml", "data_model.yaml"])
-        self.assertIn("elt/main.tf", paths)
-        self.assertIn("documentation/destination_snowflake.md", paths)
-        for absent in (
-            "check_job_status.py",
-            "snowflake_credential.json",
-            "documentation/destination_redshift.md",
-            "documentation/destination_databricks.md",
-            "documentation/databricks_authentication.md",
-            "documentation/trigger_job.md",
-        ):
-            self.assertNotIn(absent, paths)
-        self.assertFalse(any(path.startswith("destinations/") for path in paths))
+    def test_every_bundle_shows_the_readme_config_data_model_and_starter_main_tf(self) -> None:
+        for task in self.tasks:
+            with self.subTest(task=task.task_id):
+                self.assertEqual(
+                    [path for path, _ in bundle_files(task)],
+                    ["documentation/README.md", "config.yaml", "data_model.yaml", "elt/main.tf"],
+                )
+
+    def test_every_schema_file_left_out_is_rebuilt_exactly_from_the_readme(self) -> None:
+        checked = 0
+        for task in self.tasks:
+            readme = (task.public_dir / "documentation" / "README.md").read_text(encoding="utf-8")
+            for schema in sorted((task.public_dir / "schemas").glob("*.csv")):
+                with self.subTest(task=task.task_id, table=schema.stem):
+                    shown = list(csv.reader(io.StringIO(schema.read_text(encoding="utf-8"))))
+                    self.assertEqual(_schema_rows_from_readme(readme, schema.stem), shown)
+                    checked += len(shown) - 1
+        self.assertEqual(checked, 8314)
+
+    def test_example_shows_every_terraform_attribute_a_canonical_reply_uses(self) -> None:
+        from elt_taskgen.training import load_workspace_package
+        from elt_taskgen.training.canonical import render_canonical_project
+
+        example = _attribute_paths(parse_artifact(EXAMPLE_REPLY)["main.tf"])
+        for task in self.tasks:
+            package = load_workspace_package(task.release_dir, task.task_id, verify=False)
+            canonical = render_canonical_project(package)["main.tf"]
+            with self.subTest(task=task.task_id):
+                self.assertLessEqual(_attribute_paths(canonical), example)
 
     def test_prompt_is_deterministic_and_names_no_private_material(self) -> None:
         first, second = build_messages(self.task), build_messages(self.task)

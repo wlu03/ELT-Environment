@@ -29,9 +29,20 @@ population. A grader fault is not a reward: it discards the whole group, which
 is sampled again. If three attempts at a group all fault, the run stops rather
 than train on a smaller batch.
 
-The prompt holds the task's public files with credential values in
-`config.yaml` replaced by `<supplied as a Terraform variable>`; the grader
-requires credentials to be Terraform variables, so the model never needs them.
+The prompt holds four of the task's public files: `documentation/README.md`,
+`config.yaml`, `data_model.yaml` and the starter `elt/main.tf`. Credential
+values in `config.yaml` are replaced by `<supplied as a Terraform variable>`;
+the grader requires credentials to be Terraform variables, so the model never
+needs them. The other public files are left out:
+
+- The Airbyte and Terraform reference documents are the same for every task
+  (13,425 tokens). The example reply in the system prompt uses every Terraform
+  attribute that the 50 known-correct replies use.
+- Each `schemas/<table>.csv` repeats the README's Source tables entry for that
+  table, which also gives each column's type. A CSV is left out only when the
+  README lists the same columns.
+- Other destinations, credential templates and the job-status script do not
+  affect the reply.
 
 ## Run
 
@@ -66,13 +77,20 @@ Runs, checkpoints and grader attempts go under `.state/`, which is not tracked.
 
 ## Measured on batch50c (2026-09-28)
 
-48 of 50 tasks fit a 64K context; two schemapile tasks are excluded as too
-long. Base models, 24 replies on six training tasks, before any training:
+All 50 tasks fit a 64K context with the 10,240-token reply budget. Prompts
+average 23,046 tokens; the longest is 47,770. Base models, 24 replies on six
+training tasks, before any training, measured with the earlier prompt that
+still included the reference documents:
 
 | Model | Extract/Load pass | Groups with reward variance | Transform credit |
 | --- | --- | --- | --- |
 | `Qwen/Qwen3.6-35B-A3B` | 12-21% | 2-3 of 6 | none seen |
 | `Qwen/Qwen3.8-27B` | 75% | 4 of 6 | seen in a one-step run: rewards 0, 0.5, 0.75 and 1.0 |
+
+With the current prompt, `Qwen/Qwen3.8-27B` on the same six tasks passed
+Extract/Load in 14 of 24 replies, with a mean reward of 0.34 and two replies at
+1.0. Three of the ten failures merged several `flat_files` tables into one File
+source, which the earlier prompt's File source document had prevented.
 
 ## Known limits
 

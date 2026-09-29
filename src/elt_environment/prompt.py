@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import csv
+import io
 import re
 from collections.abc import Mapping
 from importlib.resources import files
@@ -12,7 +14,7 @@ from tinker_cookbook.renderers import Message
 
 from elt_environment.tasks import TaskRef
 
-RENDERER_VERSION = "bundle-v3"
+RENDERER_VERSION = "bundle-v4"
 EXAMPLE_TASK_ID = "gate__five_backend_probe"
 EXAMPLE_REPLY = files("elt_environment").joinpath("example_reply.txt").read_text(encoding="utf-8")
 CREDENTIAL_PLACEHOLDER = "<supplied as a Terraform variable>"
@@ -23,17 +25,14 @@ _CREDENTIAL_KEY = re.compile(
 _SCALAR_LINE = re.compile(r"^(?P<indent>[ \t]*)(?P<key>[A-Za-z0-9_-]+):[ \t]+(?P<value>\S.*?)[ \t]*$")
 _EMPTY_VALUES = frozenset({"''", '""', "~", "null"})
 
-_DESTINATION_DOCUMENTS = {
-    "snowflake": "destination_snowflake.md",
-    "databricks": "destination_databricks.md",
-    "redshift": "destination_redshift.md",
-}
-_DESTINATION_ONLY_DOCUMENTS = {"databricks_authentication.md": "databricks"}
-_EXCLUDED_DOCUMENTS = frozenset({"trigger_job.md"})
+_README = "documentation/README.md"
 _EXCLUDED_NAMES = frozenset({"check_job_status.py"})
-_LEADING_FILES = ("documentation/README.md", "config.yaml", "data_model.yaml")
+_LEADING_FILES = (_README, "config.yaml", "data_model.yaml")
+_SCHEMA_HEADER = ["column_name", "column_description"]
+_SOURCE_TABLE_HEADING = re.compile(r"### (?P<table>\S+)  \(source backend: [^)]+\)")
+_COLUMN_LINE = re.compile(r"- `(?P<column>[^`]+)`: ")
 
-SYSTEM_PROMPT = """You write the files for one ELT task. The user message contains the task bundle: the specification in documentation/README.md, the source and destination settings in config.yaml, the data models in data_model.yaml, the source table schemas, the provided elt/main.tf, and Airbyte and Terraform reference documents.
+SYSTEM_PROMPT = """You write the files for one ELT task. The user message contains the task bundle: the specification in documentation/README.md, whose Source tables section lists the columns of every source table, the source and destination settings in config.yaml, the data models in data_model.yaml, and the provided elt/main.tf.
 
 Write a complete project:
 - elt/main.tf: Terraform for the Airbyte provider airbytehq/airbyte version 0.6.5. Keep the provided required_providers block. Create one Airbyte source for each source section in config.yaml, the destination from config.yaml, and one airbyte_connection for each source. Each connection uses namespace_definition = "destination" and syncs exactly the tables listed for its source, each with sync_mode "full_refresh_append".
@@ -116,29 +115,55 @@ def redact_credentials(text: str) -> str:
     return redacted
 
 
-def _excluded(relative: str, destination: str) -> bool:
+def _excluded(relative: str) -> bool:
     parts = relative.split("/")
     name = parts[-1]
     if parts[0] == "destinations" or name in _EXCLUDED_NAMES or name.endswith("_credential.json"):
         return True
-    if parts[0] != "documentation":
+    return parts[0] == "documentation" and relative != _README
+
+
+def _readme_columns(readme: str) -> dict[str, list[str]]:
+    """Return the column names that the README's Source tables section lists for each table."""
+
+    tables: dict[str, list[str]] = {}
+    columns: list[str] | None = None
+    for line in readme.splitlines():
+        heading = _SOURCE_TABLE_HEADING.fullmatch(line)
+        if heading:
+            columns = tables.setdefault(heading["table"], [])
+        elif line.startswith("#"):
+            columns = None
+        elif columns is not None and (column := _COLUMN_LINE.match(line)):
+            columns.append(column["column"])
+    return tables
+
+
+def _listed_in_readme(relative: str, text: str, readme_columns: Mapping[str, list[str]]) -> bool:
+    """Return whether ``relative`` is a schema CSV whose columns the README lists in order."""
+
+    folder, _, name = relative.partition("/")
+    if folder != "schemas" or "/" in name or not name.endswith(".csv"):
         return False
-    if name in _EXCLUDED_DOCUMENTS:
-        return True
-    if name in _DESTINATION_DOCUMENTS.values() and name != _DESTINATION_DOCUMENTS.get(destination):
-        return True
-    required = _DESTINATION_ONLY_DOCUMENTS.get(name)
-    return required is not None and required != destination
+    rows = [row for row in csv.reader(io.StringIO(text)) if row]
+    if not rows or rows[0] != _SCHEMA_HEADER:
+        return False
+    return [row[0] for row in rows[1:]] == readme_columns.get(name.removesuffix(".csv"))
 
 
 def bundle_files(task: TaskRef) -> list[tuple[str, str]]:
     """Return the public files shown to the policy as ``(path, text)`` in display order.
 
-    Only regular files under ``public/<task_id>/`` are read. Other
-    destinations, credential templates, the job-status script and the
-    sync-trigger guide are left out because they do not affect the artifact.
-    Credential values in ``config.yaml`` are replaced by
-    ``CREDENTIAL_PLACEHOLDER`` before the text leaves this process.
+    Only regular files under ``public/<task_id>/`` are read. From
+    ``documentation/`` only the README is shown: the Airbyte and Terraform
+    reference documents are the same for every task, and the example reply in
+    the system prompt shows the accepted form of every block. A
+    ``schemas/<table>.csv`` file is left out when the README's Source tables
+    section lists the same columns, because that section gives the same
+    descriptions with each column's type and nullability. Other destinations,
+    credential templates and the job-status script are left out because they do
+    not affect the artifact. Credential values in ``config.yaml`` are replaced
+    by ``CREDENTIAL_PLACEHOLDER`` before the text leaves this process.
     """
 
     public = task.public_dir
@@ -147,12 +172,14 @@ def bundle_files(task: TaskRef) -> list[tuple[str, str]]:
         if path.is_symlink() or not path.is_file():
             continue
         relative = path.relative_to(public).as_posix()
-        if _excluded(relative, task.destination):
+        if _excluded(relative):
             continue
         text = path.read_text(encoding="utf-8")
         if path.name == "config.yaml":
             text = redact_credentials(text)
         selected.append((relative, text))
+    readme_columns = _readme_columns(dict(selected).get(_README, ""))
+    selected = [item for item in selected if not _listed_in_readme(*item, readme_columns)]
     rank = {name: index for index, name in enumerate(_LEADING_FILES)}
     selected.sort(key=lambda item: (rank.get(item[0], len(rank)), item[0]))
     return selected
