@@ -24,7 +24,7 @@ dev = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-elt_environment = ["py.typed"]
+elt_environment = ["py.typed", "example_reply.txt"]
 
 [tool.ruff]
 line-length = 100
