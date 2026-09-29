@@ -64,24 +64,36 @@ curriculum or harness diagnostic, not the target environment.
 
 ### L1: terminal artifact pilot
 
-The model emits one strict JSON envelope. Proposed version-one shape:
+The model emits one reply in the `artifact-blocks-v1` format, implemented by
+`src/elt_environment/artifact.py`: each file in its own block, with the path
+under `elt/`.
 
-```json
-{
-  "schema_version": "artifact-envelope-v1",
-  "files": [
-    {"path": "main.tf", "content": "..."},
-    {"path": "dbt_project.yml", "content": "..."},
-    {"path": "models/sources.yml", "content": "..."},
-    {"path": "models/example.sql", "content": "..."}
-  ]
-}
+```text
+<file path="elt/main.tf">
+...
+</file>
+<file path="elt/dbt_project.yml">
+...
+</file>
+<file path="elt/models/sources.yml">
+...
+</file>
+<file path="elt/models/example.sql">
+...
+</file>
 ```
 
-Paths are relative to candidate `elt/`. The parser must require exact keys,
-reject duplicates and Unicode/case collisions, perform no Markdown extraction
-or repair, preserve content bytes deterministically, and apply taskgen's file
-and byte caps before grading. The envelope is an adapter format only; the
+An earlier draft of this document specified a JSON envelope. It was replaced
+because a JSON envelope requires the model to escape several kilobytes of HCL
+and SQL inside string values, and one escaping error scores 0 for a reply
+whose files are otherwise correct.
+
+The parser ignores text outside the blocks and returns each block's content
+unchanged. It refuses a reply with no block, an unterminated block, a path
+outside `elt/`, a path with an empty, `.` or `..` segment, a backslash or a
+control character, or a repeated path. It performs no repair. Unicode and
+case collisions and the file and byte caps are enforced by taskgen's
+`DeclarativeEltEnv` before grading. The reply is an adapter format only; the
 authoritative submission is the sealed workspace artifact.
 
 `initial_observation()` contains the approved public task, exact response

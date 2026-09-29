@@ -1,0 +1,167 @@
+<file path="elt/main.tf">
+terraform {
+  required_providers {
+    airbyte = { source = "airbytehq/airbyte", version = "0.6.5" }
+  }
+}
+variable "workspace_id" {}
+variable "postgres_password" {}
+variable "custom_api_definition_id" {}
+variable "s3_access_key_id" {}
+variable "s3_secret_access_key" {}
+variable "destination_host" {}
+variable "destination_warehouse" {}
+variable "destination_role" {}
+variable "destination_username" {}
+variable "destination_password" {}
+variable "airbyte_client_id" {}
+variable "airbyte_client_secret" {}
+provider "airbyte" {
+  server_url = "http://airbyte-abctl-control-plane:80/api/public/v1/"
+  client_id = var.airbyte_client_id
+  client_secret = var.airbyte_client_secret
+}
+resource "airbyte_source_postgres" "src_postgres" {
+  name = "postgres"
+  workspace_id = var.workspace_id
+  definition_id = "decd338e-5647-4c0b-adf4-da0e75f5a750"
+  configuration = {
+    host = "elt-postgres"
+    port = 5432
+    database = "gate__five_backend_probe"
+    username = "postgres"
+    password = var.postgres_password
+    schemas = ["public"]
+    tunnel_method = { no_tunnel = {} }
+    ssl_mode = { disable = {} }
+    replication_method = { detect_changes_with_xmin_system_column = {} }
+  }
+}
+resource "airbyte_connection" "conn_postgres" {
+  source_id = airbyte_source_postgres.src_postgres.source_id
+  destination_id = airbyte_destination_snowflake.warehouse.destination_id
+  namespace_definition = "destination"
+  configurations = { streams = [{ name = "customers", sync_mode = "full_refresh_append" }] }
+}
+resource "airbyte_source_mongodb_v2" "src_mongodb" {
+  name = "mongodb"
+  workspace_id = var.workspace_id
+  definition_id = "b2e713cd-cc36-4c0a-b5bd-b47cb8a0561e"
+  configuration = {
+    database_config = {
+      self_managed_replica_set = {
+        connection_string = "mongodb://elt-mongodb:27017/?directConnection=true"
+        database = "gate__five_backend_probe"
+      }
+    }
+  }
+}
+resource "airbyte_connection" "conn_mongodb" {
+  source_id = airbyte_source_mongodb_v2.src_mongodb.source_id
+  destination_id = airbyte_destination_snowflake.warehouse.destination_id
+  namespace_definition = "destination"
+  configurations = { streams = [{ name = "orders", sync_mode = "full_refresh_append" }] }
+}
+resource "airbyte_source_custom" "src_custom_api" {
+  name = "custom_api"
+  workspace_id = var.workspace_id
+  definition_id = var.custom_api_definition_id
+  configuration = jsonencode({})
+}
+resource "airbyte_connection" "conn_custom_api" {
+  source_id = airbyte_source_custom.src_custom_api.source_id
+  destination_id = airbyte_destination_snowflake.warehouse.destination_id
+  namespace_definition = "destination"
+  configurations = { streams = [{ name = "events", sync_mode = "full_refresh_append" }] }
+}
+resource "airbyte_source_s3" "src_aws_s3" {
+  name = "aws_s3"
+  workspace_id = var.workspace_id
+  definition_id = "69589781-7828-43c5-9f63-8925b1c1ccc2"
+  configuration = {
+    aws_access_key_id = var.s3_access_key_id
+    aws_secret_access_key = var.s3_secret_access_key
+    bucket = "gate--five-backend-probe-bucket"
+    endpoint = "http://elt-localstack:4566"
+    region_name = "us-west-2"
+    streams = [{
+      name = "metrics"
+      format = { jsonl_format = {} }
+      globs = ["metrics.jsonl"]
+    }]
+  }
+}
+resource "airbyte_connection" "conn_aws_s3" {
+  source_id = airbyte_source_s3.src_aws_s3.source_id
+  destination_id = airbyte_destination_snowflake.warehouse.destination_id
+  namespace_definition = "destination"
+  configurations = { streams = [{ name = "metrics", sync_mode = "full_refresh_append" }] }
+}
+resource "airbyte_source_file" "src_file_order_items" {
+  name = "file_order_items"
+  workspace_id = var.workspace_id
+  definition_id = "778daa7c-feaf-4db6-96f3-70fd645acc77"
+  configuration = {
+    dataset_name = "order_items"
+    format = "csv"
+    provider = { https_public_web = {} }
+    url = "https://elt-files:8443/gate__five_backend_probe/order_items.csv"
+  }
+}
+resource "airbyte_connection" "conn_file_order_items" {
+  source_id = airbyte_source_file.src_file_order_items.source_id
+  destination_id = airbyte_destination_snowflake.warehouse.destination_id
+  namespace_definition = "destination"
+  configurations = { streams = [{ name = "order_items", sync_mode = "full_refresh_append" }] }
+}
+resource "airbyte_destination_snowflake" "warehouse" {
+  name = "snowflake"
+  workspace_id = var.workspace_id
+  definition_id = "424892c4-daac-4491-b35d-c6688ba547ba"
+  configuration = {
+    host = var.destination_host
+    database = "gate__five_backend_probe"
+    schema = "AIRBYTE_SCHEMA"
+    warehouse = var.destination_warehouse
+    role = var.destination_role
+    number_data_type = "NUMBER(38,9)"
+    username = var.destination_username
+    credentials = {
+      username_and_password = {
+        password = var.destination_password
+      }
+    }
+  }
+}
+
+</file>
+<file path="elt/dbt_project.yml">
+name: canonical_gate__five_backend_probe
+version: '1.0'
+config-version: 2
+profile: elt_taskgen
+model-paths: ['models']
+models:
+  canonical_gate__five_backend_probe:
+    +materialized: table
+
+</file>
+<file path="elt/models/sources.yml">
+version: 2
+sources:
+  - name: raw
+    database: "gate__five_backend_probe"
+    schema: "AIRBYTE_SCHEMA"
+    tables:
+      - name: "customers"
+      - name: "events"
+      - name: "metrics"
+      - name: "order_items"
+      - name: "orders"
+
+</file>
+<file path="elt/models/event_wide.sql">
+{{ config(materialized='table') }}
+SELECT CAST(e.event_id AS INT) AS event_id, CAST(e.big_count AS BIGINT) AS big_count, CAST(e.label AS VARCHAR) AS label, CAST(e.occurred_at AS TIMESTAMP) AS occurred_at, CAST(e.tz_stamp AS VARCHAR) AS tz_stamp, CAST(m.value AS DOUBLE) AS metric_value, CAST(m.big_note AS VARCHAR) AS big_note FROM {{ source('raw', 'events') }} AS e LEFT JOIN {{ source('raw', 'metrics') }} AS m ON CAST(m.event_id AS INT) = CAST(e.event_id AS INT)
+
+</file>

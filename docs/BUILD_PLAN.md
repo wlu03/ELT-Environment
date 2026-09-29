@@ -22,7 +22,7 @@ The verified canary can still drive loader and failure-path integration tests.
 | Combined task/release contract | schema-3 manifest and package loader | supported-version/admission policy | partial; canary only |
 | Corpus | generation, gates, populations, attacks | immutable catalog and family splits | blocked on releases |
 | Public observation | public release files | versioned renderer, leak scan, token preflight | missing |
-| L1 action | workspace artifact mapping | exact text envelope/parser | missing |
+| L1 action | workspace artifact mapping | `artifact-blocks-v1` reply parser | built |
 | L2 actions | Airbyte proxy/dev query/dbt primitives | tool schemas, state machine, sequential dispatcher | missing |
 | Workspace lifecycle | install, admit, seal, clean replay | async adapter and attempt registry | mostly reusable |
 | EL execution | Terraform intent and trusted local sync | optional interactive development controls | reusable for L1 |
@@ -101,7 +101,7 @@ src/elt_environment/
 
 Responsibilities:
 
-- freeze and strictly parse `artifact-envelope-v1`;
+- freeze and strictly parse `artifact-blocks-v1`;
 - translate relative files to the existing taskgen artifact mapping;
 - install exactly one fresh workspace per Env;
 - grade terminally outside the event loop with a hard deadline;
@@ -110,7 +110,7 @@ Responsibilities:
 - sanitize all policy observations and telemetry;
 - always close/retain evidence according to an explicit retention policy.
 
-Exit tests include a known-correct completion, malformed envelopes, every
+Exit tests include a known-correct completion, malformed replies, every
 workspace policy violation, grader timeout/crash/no-label, cancellation during
 dbt, artifact cap boundaries, and no private detail in model-visible output.
 
