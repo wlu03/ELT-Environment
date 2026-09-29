@@ -33,7 +33,9 @@ def discover_tasks(releases_root: Path) -> list[TaskRef]:
     """Return every task under ``releases_root``, sorted by task id.
 
     ``releases_root`` is one release directory or a directory of single-task
-    releases.
+    releases. Every task must have a family and a destination entry in its
+    manifest; a task with no family would otherwise become its own family and
+    could be split from related tasks across training and evaluation.
     """
 
     root = Path(releases_root)
@@ -49,12 +51,14 @@ def discover_tasks(releases_root: Path) -> list[TaskRef]:
         families = manifest.get("families") or {}
         destinations = manifest.get("destinations") or {}
         for task_id in manifest["tasks"]:
+            if task_id not in families or task_id not in destinations:
+                raise ValueError(f"{path}: task {task_id} has no family or destination entry")
             tasks.append(
                 TaskRef(
                     release_dir=path.parent,
                     task_id=task_id,
-                    family=families.get(task_id, task_id),
-                    destination=destinations.get(task_id, "snowflake"),
+                    family=families[task_id],
+                    destination=destinations[task_id],
                 )
             )
     tasks.sort(key=lambda task: task.task_id)

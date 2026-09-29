@@ -39,8 +39,8 @@ needs them. The other public files are left out:
   (13,425 tokens). The example reply in the system prompt uses every Terraform
   attribute that the 50 known-correct replies use.
 - Each `schemas/<table>.csv` repeats the README's Source tables entry for that
-  table, which also gives each column's type. A CSV is left out only when the
-  README lists the same columns.
+  table, which also gives each column's type. A CSV is left out only when its
+  rows equal the rows taskgen writes from that entry.
 - Other destinations, credential templates and the job-status script do not
   affect the reply.
 

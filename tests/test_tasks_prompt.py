@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import csv
-import io
-import re
+import json
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 
 import hcl2
 import yaml
-from elt_taskgen.export.eltbench import public_column_description
 
 from elt_environment.artifact import format_artifact, parse_artifact
 from elt_environment.prompt import (
@@ -75,15 +71,15 @@ Source table orders.
 ### items  (source backend: files)
 - `id`: bigint NOT NULL — Item id.
 
+### products  (source backend: s3)
+- `id`: bigint NOT NULL — Product id.
+- `kind`: text NOT NULL — Kind. one of: a, b.
+
 ### Relationships
 
 - `sku`: text NULL — Listed under another heading, so not a column of items.
 """
 SCHEMA_HEADER = "column_name,column_description\n"
-README_COLUMN = re.compile(
-    r"- `(?P<name>[^`]+)`: \S+ (?P<null>NULL|NOT NULL) —"
-    r"(?: (?P<description>.*?))?(?: one of: (?P<values>.*)\.)?"
-)
 
 
 class BundleSelectionTests(unittest.TestCase):
@@ -100,6 +96,10 @@ class BundleSelectionTests(unittest.TestCase):
                 ),
                 "schemas/items.csv": SCHEMA_HEADER + "id,Item id.\nsku,Stock unit.\n",
                 "schemas/customers.csv": SCHEMA_HEADER + "id,Customer id.\n",
+                "schemas/products.csv": (
+                    SCHEMA_HEADER
+                    + "id,Product identifier.\nkind,Kind. always exactly one of 'a', 'b'.\n"
+                ),
             }
             for relative, content in files.items():
                 (task.public_dir / relative).parent.mkdir(parents=True, exist_ok=True)
@@ -112,31 +112,9 @@ class BundleSelectionTests(unittest.TestCase):
                 "config.yaml",
                 "schemas/customers.csv",
                 "schemas/items.csv",
+                "schemas/products.csv",
             ],
         )
-
-
-def _schema_rows_from_readme(readme: str, table: str) -> list[list[str]] | None:
-    """Rebuild the rows of ``schemas/<table>.csv`` from the README the way taskgen writes them."""
-
-    section = re.search(
-        rf"^### {re.escape(table)}  \(source backend: [^)]+\)\n(.*?)(?=^#|\Z)",
-        readme,
-        re.MULTILINE | re.DOTALL,
-    )
-    if section is None:
-        return None
-    rows = [SCHEMA_HEADER.strip().split(",")]
-    for line in section[1].splitlines():
-        match = README_COLUMN.fullmatch(line)
-        if match:
-            column = SimpleNamespace(
-                description=match["description"] or "",
-                enum_values=match["values"].split(", ") if match["values"] else [],
-                nullable=match["null"] == "NULL",
-            )
-            rows.append([match["name"], public_column_description(column)])
-    return rows
 
 
 def _attribute_paths(main_tf: str) -> set[tuple[str, ...]]:
@@ -201,6 +179,30 @@ class SplitTests(unittest.TestCase):
         self.assertNotEqual(split_by_family(tasks, 2, 4)[1], evaluation)
 
 
+class DiscoverTests(unittest.TestCase):
+    def _release(self, root: Path, manifest: dict) -> None:
+        (root / "release_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    def test_a_task_without_a_family_or_destination_entry_is_refused(self) -> None:
+        for manifest in (
+            {"tasks": {"t": "0"}, "destinations": {"t": "snowflake"}},
+            {"tasks": {"t": "0"}, "families": {"t": "f"}},
+        ):
+            with tempfile.TemporaryDirectory() as root, self.subTest(manifest=manifest):
+                self._release(Path(root), manifest)
+                with self.assertRaises(ValueError):
+                    discover_tasks(Path(root))
+
+    def test_family_and_destination_come_from_the_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            self._release(
+                Path(root),
+                {"tasks": {"t": "0"}, "families": {"t": "f"}, "destinations": {"t": "databricks"}},
+            )
+            (task,) = discover_tasks(Path(root))
+        self.assertEqual((task.task_id, task.family, task.destination), ("t", "f", "databricks"))
+
+
 @unittest.skipUnless(RELEASES.is_dir(), "batch50c releases are not on disk")
 class ReleaseAndPromptTests(unittest.TestCase):
     @classmethod
@@ -220,17 +222,6 @@ class ReleaseAndPromptTests(unittest.TestCase):
                     [path for path, _ in bundle_files(task)],
                     ["documentation/README.md", "config.yaml", "data_model.yaml", "elt/main.tf"],
                 )
-
-    def test_every_schema_file_left_out_is_rebuilt_exactly_from_the_readme(self) -> None:
-        checked = 0
-        for task in self.tasks:
-            readme = (task.public_dir / "documentation" / "README.md").read_text(encoding="utf-8")
-            for schema in sorted((task.public_dir / "schemas").glob("*.csv")):
-                with self.subTest(task=task.task_id, table=schema.stem):
-                    shown = list(csv.reader(io.StringIO(schema.read_text(encoding="utf-8"))))
-                    self.assertEqual(_schema_rows_from_readme(readme, schema.stem), shown)
-                    checked += len(shown) - 1
-        self.assertEqual(checked, 8314)
 
     def test_example_shows_every_terraform_attribute_a_canonical_reply_uses(self) -> None:
         from elt_taskgen.training import load_workspace_package

@@ -7,9 +7,11 @@ import io
 import re
 from collections.abc import Mapping
 from importlib.resources import files
+from types import SimpleNamespace
 from typing import Any
 
 import yaml
+from elt_taskgen.export.eltbench import public_column_description
 from tinker_cookbook.renderers import Message
 
 from elt_environment.tasks import TaskRef
@@ -30,7 +32,10 @@ _EXCLUDED_NAMES = frozenset({"check_job_status.py"})
 _LEADING_FILES = (_README, "config.yaml", "data_model.yaml")
 _SCHEMA_HEADER = ["column_name", "column_description"]
 _SOURCE_TABLE_HEADING = re.compile(r"### (?P<table>\S+)  \(source backend: [^)]+\)")
-_COLUMN_LINE = re.compile(r"- `(?P<column>[^`]+)`: ")
+_COLUMN_LINE = re.compile(
+    r"- `(?P<name>[^`]+)`: \S+ (?P<null>NULL|NOT NULL) —"
+    r"(?: (?P<description>.*?))?(?: one of: (?P<values>.*)\.)?"
+)
 
 SYSTEM_PROMPT = """You write the files for one ELT task. The user message contains the task bundle: the specification in documentation/README.md, whose Source tables section lists the columns of every source table, the source and destination settings in config.yaml, the data models in data_model.yaml, and the provided elt/main.tf.
 
@@ -123,24 +128,34 @@ def _excluded(relative: str) -> bool:
     return parts[0] == "documentation" and relative != _README
 
 
-def _readme_columns(readme: str) -> dict[str, list[str]]:
-    """Return the column names that the README's Source tables section lists for each table."""
+def _column_spec(match: re.Match[str]) -> SimpleNamespace:
+    return SimpleNamespace(
+        description=match["description"] or "",
+        enum_values=match["values"].split(", ") if match["values"] else [],
+        nullable=match["null"] == "NULL",
+    )
 
-    tables: dict[str, list[str]] = {}
-    columns: list[str] | None = None
+
+def _readme_rows(readme: str) -> dict[str, list[list[str]]]:
+    """Return the schema CSV rows taskgen writes for each table in the README's Source tables."""
+
+    tables: dict[str, list[list[str]]] = {}
+    rows: list[list[str]] | None = None
     for line in readme.splitlines():
         heading = _SOURCE_TABLE_HEADING.fullmatch(line)
         if heading:
-            columns = tables.setdefault(heading["table"], [])
+            rows = tables.setdefault(heading["table"], [])
         elif line.startswith("#"):
-            columns = None
-        elif columns is not None and (column := _COLUMN_LINE.match(line)):
-            columns.append(column["column"])
+            rows = None
+        elif rows is not None and (column := _COLUMN_LINE.fullmatch(line)):
+            rows.append([column["name"], public_column_description(_column_spec(column))])
     return tables
 
 
-def _listed_in_readme(relative: str, text: str, readme_columns: Mapping[str, list[str]]) -> bool:
-    """Return whether ``relative`` is a schema CSV whose columns the README lists in order."""
+def _listed_in_readme(
+    relative: str, text: str, readme_rows: Mapping[str, list[list[str]]]
+) -> bool:
+    """Return whether ``relative`` is a schema CSV whose rows equal the README's rows for it."""
 
     folder, _, name = relative.partition("/")
     if folder != "schemas" or "/" in name or not name.endswith(".csv"):
@@ -148,7 +163,7 @@ def _listed_in_readme(relative: str, text: str, readme_columns: Mapping[str, lis
     rows = [row for row in csv.reader(io.StringIO(text)) if row]
     if not rows or rows[0] != _SCHEMA_HEADER:
         return False
-    return [row[0] for row in rows[1:]] == readme_columns.get(name.removesuffix(".csv"))
+    return rows[1:] == readme_rows.get(name.removesuffix(".csv"))
 
 
 def bundle_files(task: TaskRef) -> list[tuple[str, str]]:
@@ -158,9 +173,9 @@ def bundle_files(task: TaskRef) -> list[tuple[str, str]]:
     ``documentation/`` only the README is shown: the Airbyte and Terraform
     reference documents are the same for every task, and the example reply in
     the system prompt shows the accepted form of every block. A
-    ``schemas/<table>.csv`` file is left out when the README's Source tables
-    section lists the same columns, because that section gives the same
-    descriptions with each column's type and nullability. Other destinations,
+    ``schemas/<table>.csv`` file is left out when its rows equal the rows
+    taskgen writes from the README's Source tables entry for that table, which
+    also gives each column's type. Other destinations,
     credential templates and the job-status script are left out because they do
     not affect the artifact. Credential values in ``config.yaml`` are replaced
     by ``CREDENTIAL_PLACEHOLDER`` before the text leaves this process.
@@ -178,8 +193,8 @@ def bundle_files(task: TaskRef) -> list[tuple[str, str]]:
         if path.name == "config.yaml":
             text = redact_credentials(text)
         selected.append((relative, text))
-    readme_columns = _readme_columns(dict(selected).get(_README, ""))
-    selected = [item for item in selected if not _listed_in_readme(*item, readme_columns)]
+    readme_rows = _readme_rows(dict(selected).get(_README, ""))
+    selected = [item for item in selected if not _listed_in_readme(*item, readme_rows)]
     rank = {name: index for index, name in enumerate(_LEADING_FILES)}
     selected.sort(key=lambda item: (rank.get(item[0], len(rank)), item[0]))
     return selected

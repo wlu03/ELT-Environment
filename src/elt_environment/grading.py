@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from elt_environment.tasks import TaskRef
 
 _REASON_CODE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 _PHASES = ("none", "terraform", "sync", "dbt", "mart", "immutability", "workspace")
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,12 +40,22 @@ def _reason_code(code: str) -> str:
     return code if _REASON_CODE.fullmatch(code) else "harness_fault"
 
 
+def _close(env: DeclarativeEltEnv, task_id: str) -> None:
+    """Remove the episode directory. A failure here is logged and does not change the outcome."""
+
+    try:
+        env.close()
+    except Exception:
+        logger.exception("grader cleanup failed on %s", task_id)
+
+
 def grade_artifact(task: TaskRef, files: Mapping[str, str], config: GraderConfig) -> GraderOutcome:
     """Seal ``files`` into a fresh attempt and score them on every hidden population.
 
     Returns ``DiscardGroup`` when the grader produced no label, which happens
-    only for task, harness or infrastructure faults. Blocks for the length of
-    one grade, so callers run it in a worker thread.
+    only for task, harness or infrastructure faults, or when the grader raised.
+    The exception is logged here and the group is sampled again. Blocks for the
+    length of one grade, so callers run it in a worker thread.
     """
 
     Path(config.attempts_root).mkdir(parents=True, exist_ok=True)
@@ -58,8 +70,11 @@ def grade_artifact(task: TaskRef, files: Mapping[str, str], config: GraderConfig
     try:
         env.reset(task.task_id)
         step = env.step(dict(files))
+    except Exception:
+        logger.exception("grader raised on %s", task.task_id)
+        return DiscardGroup("grader_exception")
     finally:
-        env.close()
+        _close(env, task.task_id)
     signal = step.signal
     if not signal.label_valid or signal.reward is None:
         return DiscardGroup(_reason_code(step.harness_fault_code or "unlabelled"))

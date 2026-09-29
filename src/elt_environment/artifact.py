@@ -6,9 +6,9 @@ import re
 from collections.abc import Mapping
 
 ARTIFACT_PREFIX = "elt/"
-_FILE_BLOCK = re.compile(r'<file path="([^"\n]+)">\n(.*?)\n</file>', re.DOTALL)
-_OPEN_TAG = re.compile(r"<file\b")
-_CLOSE_TAG = re.compile(r"</file>")
+_FILE_BLOCK = re.compile(r'^<file path="([^"\n]+)">\n(.*?)\n</file>$', re.DOTALL | re.MULTILINE)
+_OPEN_TAG = re.compile(r"^<file\b", re.MULTILINE)
+_CLOSE_TAG = re.compile(r"^</file>$", re.MULTILINE)
 _UNSAFE_SEGMENTS = frozenset({"", ".", ".."})
 
 
@@ -25,7 +25,8 @@ def _safe_relative_path(relative: str) -> bool:
 def parse_artifact(text: str) -> dict[str, str]:
     """Return ``{path relative to elt/: content}`` for every file block in ``text``.
 
-    Text outside the blocks is ignored. Content inside a block is returned
+    Text outside the blocks is ignored, and a tag counts only at the start of
+    a line, so prose may mention ``<file>``. Content inside a block is returned
     unchanged. A reply with no block, an unterminated block, a path outside
     ``elt/``, a path with an empty, ``.`` or ``..`` segment, a backslash or a
     control character, or a repeated path is refused.

@@ -44,6 +44,15 @@ class ParseArtifactTests(unittest.TestCase):
                 parse_artifact(f'<file path="{path}">\nx\n</file>')
             self.assertEqual(str(raised.exception), "unsafe_path")
 
+    def test_prose_that_mentions_a_tag_inside_a_line_still_parses(self) -> None:
+        for reply in (
+            'Each <file> block holds one file.\n<file path="elt/a.sql">\nselect 1\n</file>',
+            'Write the files now, each in a <file path="elt/..."> block.\n'
+            '<file path="elt/a.sql">\nselect 1\n</file>\nEvery </file> is closed.',
+        ):
+            with self.subTest(reply=reply):
+                self.assertEqual(parse_artifact(reply), {"a.sql": "select 1"})
+
     def test_nested_model_paths_are_accepted(self) -> None:
         files = parse_artifact('<file path="elt/models/marts/a.sql">\nselect 1\n</file>')
         self.assertEqual(files, {"models/marts/a.sql": "select 1"})
