@@ -59,6 +59,7 @@ class ProbeConfig:
     eval_families: int = 5
     seed: int = 0
     grader_concurrency: int = 8
+    verify_releases: bool = True
     out_dir: str | None = None
 
 
@@ -72,7 +73,7 @@ async def probe(config: ProbeConfig) -> dict:
         renderer,
         context_length=config.context_length,
         max_tokens=config.max_tokens,
-        verify=False,
+        verify=config.verify_releases,
     )
     train, _ = split_by_family([a.task for a in admitted], config.eval_families, config.seed)
     if config.task_ids:

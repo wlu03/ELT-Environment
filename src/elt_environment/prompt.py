@@ -2,15 +2,26 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from importlib.resources import files
+from typing import Any
 
+import yaml
 from tinker_cookbook.renderers import Message
 
 from elt_environment.tasks import TaskRef
 
-RENDERER_VERSION = "bundle-v2"
+RENDERER_VERSION = "bundle-v3"
 EXAMPLE_TASK_ID = "gate__five_backend_probe"
 EXAMPLE_REPLY = files("elt_environment").joinpath("example_reply.txt").read_text(encoding="utf-8")
+CREDENTIAL_PLACEHOLDER = "<supplied as a Terraform variable>"
+
+_CREDENTIAL_KEY = re.compile(
+    r"password|passwd|secret|access_key|api_key|token|private_key|credential", re.IGNORECASE
+)
+_SCALAR_LINE = re.compile(r"^(?P<indent>[ \t]*)(?P<key>[A-Za-z0-9_-]+):[ \t]+(?P<value>\S.*?)[ \t]*$")
+_EMPTY_VALUES = frozenset({"''", '""', "~", "null"})
 
 _DESTINATION_DOCUMENTS = {
     "snowflake": "destination_snowflake.md",
@@ -32,7 +43,7 @@ Write a complete project:
 
 The grader checks these rules. A reply that breaks one scores 0.
 - main.tf contains only terraform, provider, resource and variable blocks. Do not use output, locals, data, module, count, for_each or dynamic.
-- These values are supplied when the project is applied, so each one is a variable: every password, secret, access key and client credential, even when config.yaml shows its value, such as the Postgres password or the S3 access keys; the Airbyte workspace id; the destination host, role, warehouse, username and password; and every value that config.yaml leaves empty. Declare each one as an empty variable block with no default, for example variable "postgres_password" {}, and reference it as var.postgres_password. Every source and the destination use the same workspace id variable.
+- These values are supplied when the project is applied, so each one is a variable: every password, secret, access key and client credential, which config.yaml shows as '<supplied as a Terraform variable>'; the Airbyte workspace id; the destination host, role, warehouse, username and password; and every value that config.yaml leaves empty. Declare each one as an empty variable block with no default, for example variable "postgres_password" {}, and reference it as var.postgres_password. Every source and the destination use the same workspace id variable.
 - Every other value comes from config.yaml and is written literally: hosts, ports, database and schema names, buckets, endpoints, regions, URLs, connection strings and definition ids. The destination database and schema are literals.
 - A Snowflake destination configuration has exactly these eight keys and no others. The host variable takes the place of the account field in config.yaml, and there is no top-level password:
   configuration = {
@@ -62,6 +73,49 @@ Below is a correct reply for a different task, gate__five_backend_probe, which h
 """
 
 
+class BundleRedactionError(ValueError):
+    """A credential value in the bundle could not be replaced safely."""
+
+
+def _masked(node: Any) -> Any:
+    if isinstance(node, Mapping):
+        return {
+            key: CREDENTIAL_PLACEHOLDER
+            if _CREDENTIAL_KEY.search(str(key))
+            and value not in (None, "")
+            and not isinstance(value, (Mapping, list))
+            else _masked(value)
+            for key, value in node.items()
+        }
+    if isinstance(node, list):
+        return [_masked(value) for value in node]
+    return node
+
+
+def redact_credentials(text: str) -> str:
+    """Replace the value of every credential-named YAML key with ``CREDENTIAL_PLACEHOLDER``.
+
+    The result must parse to the original document with exactly those values
+    replaced. Otherwise ``BundleRedactionError`` is raised and nothing is sent.
+    """
+
+    lines: list[str] = []
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        match = _SCALAR_LINE.match(body)
+        if match and _CREDENTIAL_KEY.search(match["key"]) and match["value"] not in _EMPTY_VALUES:
+            line = f"{match['indent']}{match['key']}: '{CREDENTIAL_PLACEHOLDER}'{line[len(body):]}"
+        lines.append(line)
+    redacted = "".join(lines)
+    try:
+        faithful = yaml.safe_load(redacted) == _masked(yaml.safe_load(text))
+    except yaml.YAMLError as error:
+        raise BundleRedactionError("config is not valid YAML") from error
+    if not faithful:
+        raise BundleRedactionError("redaction changed values other than credentials")
+    return redacted
+
+
 def _excluded(relative: str, destination: str) -> bool:
     parts = relative.split("/")
     name = parts[-1]
@@ -83,6 +137,8 @@ def bundle_files(task: TaskRef) -> list[tuple[str, str]]:
     Only regular files under ``public/<task_id>/`` are read. Other
     destinations, credential templates, the job-status script and the
     sync-trigger guide are left out because they do not affect the artifact.
+    Credential values in ``config.yaml`` are replaced by
+    ``CREDENTIAL_PLACEHOLDER`` before the text leaves this process.
     """
 
     public = task.public_dir
@@ -93,7 +149,10 @@ def bundle_files(task: TaskRef) -> list[tuple[str, str]]:
         relative = path.relative_to(public).as_posix()
         if _excluded(relative, task.destination):
             continue
-        selected.append((relative, path.read_text(encoding="utf-8")))
+        text = path.read_text(encoding="utf-8")
+        if path.name == "config.yaml":
+            text = redact_credentials(text)
+        selected.append((relative, text))
     rank = {name: index for index, name in enumerate(_LEADING_FILES)}
     selected.sort(key=lambda item: (rank.get(item[0], len(rank)), item[0]))
     return selected

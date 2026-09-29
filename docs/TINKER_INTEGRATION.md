@@ -153,8 +153,10 @@ preserve the configured batch shape and record the filter rate.
 
 Use the native Tinker sampling path used by Cookbook RL, retaining sampled
 tokens and sampling log probabilities for training. Decode action content once
-with the same renderer used in preflight. The environment must not repair JSON,
-extract code fences, or ask a second model to reinterpret an action.
+with the same renderer used in preflight, then parse it once as
+`artifact-blocks-v1` (see `ARCHITECTURE.md`). The environment must not repair
+a malformed reply, extract code fences, or ask a second model to reinterpret
+an action.
 
 Preflight every admitted task with:
 

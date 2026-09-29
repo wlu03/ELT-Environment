@@ -10,7 +10,7 @@ from elt_taskgen.training.canonical import render_canonical_project
 from tinker_cookbook.renderers import Renderer
 
 from elt_environment.artifact import format_artifact
-from elt_environment.prompt import EXAMPLE_TASK_ID, build_messages
+from elt_environment.prompt import EXAMPLE_TASK_ID, BundleRedactionError, build_messages
 from elt_environment.tasks import TaskRef
 
 
@@ -41,9 +41,10 @@ def admit_tasks(
 ) -> tuple[list[Admission], list[Exclusion]]:
     """Split ``tasks`` into admitted tasks and exclusions.
 
-    A task is excluded when its release fails to load or verify, when the
-    known-correct reply is longer than ``max_tokens``, or when the prompt
-    plus ``max_tokens`` exceeds ``context_length``. An excluded task is not
+    A task is excluded when its release fails to load or verify, when a
+    credential in its bundle cannot be redacted, when the known-correct reply
+    is longer than ``max_tokens``, or when the prompt plus ``max_tokens``
+    exceeds ``context_length``. An excluded task is not
     scored; it is a task or configuration problem, not a policy failure.
     """
 
@@ -59,7 +60,12 @@ def admit_tasks(
         except Exception as error:
             excluded.append(Exclusion(task.task_id, f"release_invalid:{type(error).__name__}"))
             continue
-        prompt_tokens = renderer.build_generation_prompt(build_messages(task)).length
+        try:
+            messages = build_messages(task)
+        except BundleRedactionError:
+            excluded.append(Exclusion(task.task_id, "bundle_redaction_failed"))
+            continue
+        prompt_tokens = renderer.build_generation_prompt(messages).length
         reply_tokens = len(renderer.tokenizer.encode(reply, add_special_tokens=False))
         if reply_tokens > max_tokens:
             excluded.append(Exclusion(task.task_id, "reply_over_max_tokens"))

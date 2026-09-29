@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 import unittest
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
+from unittest import mock
 
 import tinker
 from tinker_cookbook.completers import StopCondition, TokenCompleter, TokensWithLogprobs
 from tinker_cookbook.rl.types import Env, EnvGroupBuilder, StepResult
 
-from elt_environment.env import GroupRetryExhausted, RetryWholeGroup
-from elt_environment.outcomes import DiscardGroupSignal
+from elt_environment.env import EltDataset, GroupRetryExhausted, RetryWholeGroup, run_grader
+from elt_environment.outcomes import DiscardGroupSignal, ValidReward
+from elt_environment.tasks import TaskRef
 
 
 class ScriptedPolicy(TokenCompleter):
@@ -89,8 +94,75 @@ class RetryWholeGroupTests(unittest.TestCase):
             _run(RetryWholeGroup(max_attempts=3), builder)
         self.assertEqual(builder.calls, 1)
 
-    def test_strategy_catches_group_errors_so_the_trainer_skips_an_exhausted_group(self) -> None:
-        self.assertTrue(RetryWholeGroup().catches_group_errors)
+    def test_exhaustion_is_not_caught_so_the_trainer_never_shrinks_a_batch(self) -> None:
+        self.assertFalse(RetryWholeGroup().catches_group_errors)
+
+
+class GraderConcurrencyTests(unittest.TestCase):
+    def test_cancelled_rollouts_keep_their_grader_slot_until_the_grade_returns(self) -> None:
+        workers = 3
+        state = {"active": 0, "peak": 0, "graded": 0}
+        lock = threading.Lock()
+
+        def slow_grade(task, files, grader):
+            with lock:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            time.sleep(0.3)
+            with lock:
+                state["active"] -= 1
+                state["graded"] += 1
+            return ValidReward(0.0)
+
+        async def scenario() -> None:
+            with mock.patch("elt_environment.env.grade_artifact", slow_grade):
+                first = [asyncio.ensure_future(run_grader(None, {}, None, workers)) for _ in range(workers)]
+                for _ in range(200):
+                    if state["active"] == workers:
+                        break
+                    await asyncio.sleep(0.01)
+                for rollout in first:
+                    rollout.cancel()
+                await asyncio.gather(*first, return_exceptions=True)
+                second = [asyncio.ensure_future(run_grader(None, {}, None, workers)) for _ in range(workers)]
+                await asyncio.gather(*second)
+
+        asyncio.run(scenario())
+        self.assertEqual(state["peak"], workers)
+        self.assertEqual(state["graded"], 2 * workers)
+
+
+class DatasetTests(unittest.TestCase):
+    def _dataset(self, count: int, groups_per_batch: int, epochs: int = 1) -> EltDataset:
+        tasks = [TaskRef(Path("/nonexistent"), f"t{index}", f"f{index}", "snowflake") for index in range(count)]
+        return EltDataset(
+            tasks,
+            groups_per_batch=groups_per_batch,
+            epochs=epochs,
+            seed=0,
+            shuffle=True,
+            make_builder=lambda task: task,
+        )
+
+    def _batches(self, dataset: EltDataset) -> list[list[TaskRef]]:
+        return [list(dataset.get_batch(index)) for index in range(len(dataset))]
+
+    def test_every_task_is_trained_and_every_batch_is_full(self) -> None:
+        for count, groups_per_batch, epochs in ((9, 8, 1), (5, 8, 1), (43, 8, 4), (16, 8, 1), (1, 4, 2)):
+            with self.subTest(count=count, groups_per_batch=groups_per_batch, epochs=epochs):
+                batches = self._batches(self._dataset(count, groups_per_batch, epochs))
+                self.assertTrue(batches)
+                self.assertTrue(all(len(batch) == groups_per_batch for batch in batches))
+                seen = [task.task_id for batch in batches for task in batch]
+                for index in range(count):
+                    self.assertGreaterEqual(seen.count(f"t{index}"), epochs)
+
+    def test_an_exact_multiple_adds_no_padding(self) -> None:
+        self.assertEqual(len(self._dataset(16, 8)), 2)
+
+    def test_an_empty_task_list_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            self._dataset(0, 8)
 
 
 if __name__ == "__main__":

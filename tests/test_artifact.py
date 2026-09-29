@@ -30,6 +30,24 @@ class ParseArtifactTests(unittest.TestCase):
                 parse_artifact(reply)
             self.assertEqual(str(raised.exception), reason)
 
+    def test_paths_that_could_leave_the_project_root_are_refused(self) -> None:
+        for path in (
+            "elt/../outside",
+            "elt/models/../../outside",
+            "elt/./main.tf",
+            "elt//etc/passwd",
+            "elt/models/",
+            "elt/models\\a.sql",
+            "elt/models/a\x00.sql",
+        ):
+            with self.subTest(path=path), self.assertRaises(ArtifactFormatError) as raised:
+                parse_artifact(f'<file path="{path}">\nx\n</file>')
+            self.assertEqual(str(raised.exception), "unsafe_path")
+
+    def test_nested_model_paths_are_accepted(self) -> None:
+        files = parse_artifact('<file path="elt/models/marts/a.sql">\nselect 1\n</file>')
+        self.assertEqual(files, {"models/marts/a.sql": "select 1"})
+
     def test_unterminated_second_block_refuses_the_whole_reply(self) -> None:
         reply = '<file path="elt/a.sql">\n1\n</file>\n<file path="elt/b.sql">\n2\n'
         with self.assertRaises(ArtifactFormatError):

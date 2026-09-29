@@ -6,7 +6,8 @@ import asyncio
 import functools
 import logging
 import random
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -34,13 +35,11 @@ from tinker_cookbook.utils.logtree_formatters import ConversationFormatter
 from elt_environment.admission import admit_tasks
 from elt_environment.artifact import ArtifactFormatError, parse_artifact
 from elt_environment.grading import GraderConfig, grade_artifact
-from elt_environment.outcomes import DiscardGroupSignal, require_tinker_reward
+from elt_environment.outcomes import DiscardGroupSignal, GraderOutcome, require_tinker_reward
 from elt_environment.prompt import build_messages
 from elt_environment.tasks import TaskRef, discover_tasks, split_by_family
 
 logger = logging.getLogger(__name__)
-
-_GRADER_SLOTS: dict[int, asyncio.Semaphore] = {}
 
 
 @functools.lru_cache(maxsize=8)
@@ -50,12 +49,23 @@ def cached_renderer(model_name: str, renderer_name: str) -> renderers.Renderer:
     return renderers.get_renderer(renderer_name, tokenizer=get_tokenizer(model_name))
 
 
-def _grader_slots(limit: int) -> asyncio.Semaphore:
-    loop_id = id(asyncio.get_running_loop())
-    slots = _GRADER_SLOTS.get(loop_id)
-    if slots is None:
-        slots = _GRADER_SLOTS[loop_id] = asyncio.Semaphore(limit)
-    return slots
+@functools.lru_cache(maxsize=None)
+def _grader_pool(workers: int) -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="elt-grader")
+
+
+async def run_grader(
+    task: TaskRef, files: Mapping[str, str], grader: GraderConfig, workers: int
+) -> GraderOutcome:
+    """Grade on a shared pool of ``workers`` threads and return the outcome.
+
+    A pool thread stays occupied until its grade returns, even when the
+    awaiting rollout is cancelled, so at most ``workers`` grades run at once.
+    A cancelled grade that has not started is removed from the queue.
+    """
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_grader_pool(workers), grade_artifact, task, files, grader)
 
 
 class EltEnv(Env):
@@ -99,8 +109,7 @@ class EltEnv(Env):
             files = parse_artifact(renderers.get_text_content(message))
         except ArtifactFormatError:
             return self._final(0.0, {"format_error": 1.0, "r_el": 0.0, "r_t": 0.0, "el_pass": 0.0})
-        async with _grader_slots(self.grader_concurrency):
-            outcome = await asyncio.to_thread(grade_artifact, self.task, files, self.grader)
+        outcome = await run_grader(self.task, files, self.grader, self.grader_concurrency)
         reward = require_tinker_reward(outcome)
         return self._final(reward, {"format_error": 0.0, **outcome.metrics})
 
@@ -137,15 +146,16 @@ class RetryWholeGroup(RolloutStrategy):
     """Discard the whole group when any rollout has no label, then sample a fresh group.
 
     No trajectory from a discarded attempt is kept, so a group is never a mix
-    of attempts. After ``max_attempts`` discards the group is skipped and the
-    trainer counts it in ``rollout_errors/groups_skipped``.
+    of attempts. After ``max_attempts`` discards, ``GroupRetryExhausted``
+    propagates and stops the run, so the trainer never trains on a batch
+    with fewer groups than configured.
     """
 
     max_attempts: int = 3
 
     @property
     def catches_group_errors(self) -> bool:
-        return True
+        return False
 
     async def execute(
         self,
@@ -181,7 +191,13 @@ async def _cancel_all(rollouts: Sequence[asyncio.Future]) -> None:
 
 
 class EltDataset(RLDataset):
-    """Batches of task groups in a seeded order; each epoch is shuffled again."""
+    """Complete batches of task groups in a seeded order.
+
+    Each epoch is shuffled again. When the task occurrences do not fill the
+    last batch, it is filled from a further pass over the tasks, so every task
+    is trained at least ``epochs`` times and every batch has
+    ``groups_per_batch`` groups.
+    """
 
     def __init__(
         self,
@@ -195,13 +211,21 @@ class EltDataset(RLDataset):
     ) -> None:
         if groups_per_batch < 1:
             raise ValueError("groups_per_batch must be at least 1")
+        if not tasks:
+            raise ValueError("a dataset needs at least one task")
         rng = random.Random(seed)
+
+        def one_pass() -> list[TaskRef]:
+            items = list(tasks)
+            if shuffle:
+                rng.shuffle(items)
+            return items
+
         order: list[TaskRef] = []
         for _ in range(max(1, epochs)):
-            epoch = list(tasks)
-            if shuffle:
-                rng.shuffle(epoch)
-            order.extend(epoch)
+            order.extend(one_pass())
+        while len(order) % groups_per_batch:
+            order.extend(one_pass()[: groups_per_batch - len(order) % groups_per_batch])
         self.order = order
         self.groups_per_batch = groups_per_batch
         self.make_builder = make_builder
@@ -250,6 +274,11 @@ class EltDatasetBuilder(RLDatasetBuilder):
         train, evaluation = split_by_family(
             [admission.task for admission in admitted], self.eval_families, self.seed
         )
+        if not train:
+            raise ValueError(
+                f"no training tasks: {len(tasks)} found, {len(admitted)} admitted, "
+                f"{len(evaluation)} held out for evaluation"
+            )
         logger.info(
             "tasks: %d found, %d admitted, %d train, %d eval (%s)",
             len(tasks),

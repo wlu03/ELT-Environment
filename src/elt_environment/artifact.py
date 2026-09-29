@@ -9,10 +9,17 @@ ARTIFACT_PREFIX = "elt/"
 _FILE_BLOCK = re.compile(r'<file path="([^"\n]+)">\n(.*?)\n</file>', re.DOTALL)
 _OPEN_TAG = re.compile(r"<file\b")
 _CLOSE_TAG = re.compile(r"</file>")
+_UNSAFE_SEGMENTS = frozenset({"", ".", ".."})
 
 
 class ArtifactFormatError(ValueError):
     """The reply does not contain a well-formed set of file blocks."""
+
+
+def _safe_relative_path(relative: str) -> bool:
+    if "\\" in relative or any(ord(character) < 32 or ord(character) == 127 for character in relative):
+        return False
+    return not any(segment in _UNSAFE_SEGMENTS for segment in relative.split("/"))
 
 
 def parse_artifact(text: str) -> dict[str, str]:
@@ -20,7 +27,8 @@ def parse_artifact(text: str) -> dict[str, str]:
 
     Text outside the blocks is ignored. Content inside a block is returned
     unchanged. A reply with no block, an unterminated block, a path outside
-    ``elt/``, or a repeated path is refused.
+    ``elt/``, a path with an empty, ``.`` or ``..`` segment, a backslash or a
+    control character, or a repeated path is refused.
     """
 
     blocks = _FILE_BLOCK.findall(text)
@@ -35,6 +43,8 @@ def parse_artifact(text: str) -> dict[str, str]:
         if not path.startswith(ARTIFACT_PREFIX) or path == ARTIFACT_PREFIX:
             raise ArtifactFormatError("path_outside_elt")
         relative = path[len(ARTIFACT_PREFIX) :]
+        if not _safe_relative_path(relative):
+            raise ArtifactFormatError("unsafe_path")
         if relative in files:
             raise ArtifactFormatError("duplicate_path")
         files[relative] = content

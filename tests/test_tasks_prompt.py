@@ -3,9 +3,57 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
+import yaml
+
 from elt_environment.artifact import format_artifact, parse_artifact
-from elt_environment.prompt import EXAMPLE_REPLY, EXAMPLE_TASK_ID, build_messages, bundle_files
+from elt_environment.prompt import (
+    CREDENTIAL_PLACEHOLDER,
+    EXAMPLE_REPLY,
+    EXAMPLE_TASK_ID,
+    BundleRedactionError,
+    build_messages,
+    bundle_files,
+    redact_credentials,
+)
 from elt_environment.tasks import TaskRef, discover_tasks, split_by_family
+
+CONFIG = """Airbyte:
+  config:
+    password: ''
+    server_url: http://airbyte:80/api/public/v1/
+aws_s3:
+  AWS_ACCESS_KEY_ID: key-id-value
+  AWS_SECRET_ACCESS_KEY: "secret value"
+  AWS_ENDPOINT_URL: http://localstack:4566
+postgres:
+  config:
+    host: elt-postgres
+    password: pg-password-value  # set by the harness
+    user: postgres
+"""
+
+
+class RedactionTests(unittest.TestCase):
+    def test_credential_values_are_replaced_and_everything_else_is_kept(self) -> None:
+        redacted = redact_credentials(CONFIG)
+        for secret in ("key-id-value", "secret value", "pg-password-value"):
+            self.assertNotIn(secret, redacted)
+        document = yaml.safe_load(redacted)
+        self.assertEqual(document["aws_s3"]["AWS_ACCESS_KEY_ID"], CREDENTIAL_PLACEHOLDER)
+        self.assertEqual(document["aws_s3"]["AWS_SECRET_ACCESS_KEY"], CREDENTIAL_PLACEHOLDER)
+        self.assertEqual(document["postgres"]["config"]["password"], CREDENTIAL_PLACEHOLDER)
+        self.assertEqual(document["Airbyte"]["config"]["password"], "")
+        self.assertEqual(document["postgres"]["config"]["user"], "postgres")
+        self.assertEqual(document["aws_s3"]["AWS_ENDPOINT_URL"], "http://localstack:4566")
+
+    def test_a_credential_the_line_rule_cannot_replace_refuses_the_bundle(self) -> None:
+        for text in (
+            "postgres:\n  password: |\n    multi\n    line\n",
+            "sources:\n  - password: listed-value\n",
+            "postgres: {password: inline-value}\n",
+        ):
+            with self.subTest(text=text), self.assertRaises(BundleRedactionError):
+                redact_credentials(text)
 
 TASKGEN = Path(__file__).resolve().parents[2] / "ELT-taskgen"
 RELEASES = TASKGEN / "runs" / "batch50c_20260923" / "workspace" / "releases"
@@ -78,6 +126,25 @@ class ReleaseAndPromptTests(unittest.TestCase):
         text = first[0]["content"] + first[1]["content"]
         for marker in ("answer_key", "private/", "/gold/", ".duckdb", "task_ir", str(RELEASES)):
             self.assertNotIn(marker, text)
+
+    def test_no_task_sends_a_credential_value_to_the_model(self) -> None:
+        checked = 0
+        for task in self.tasks:
+            original = yaml.safe_load((task.public_dir / "config.yaml").read_text(encoding="utf-8"))
+            shown = yaml.safe_load(dict(bundle_files(task))["config.yaml"])
+            fields = [("aws_s3", key) for key in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY")]
+            with self.subTest(task=task.task_id):
+                for section, key in fields:
+                    if (original.get(section) or {}).get(key):
+                        self.assertEqual(shown[section][key], CREDENTIAL_PLACEHOLDER)
+                        checked += 1
+                if ((original.get("postgres") or {}).get("config") or {}).get("password"):
+                    self.assertEqual(shown["postgres"]["config"]["password"], CREDENTIAL_PLACEHOLDER)
+                    checked += 1
+                self.assertEqual(
+                    shown["snowflake"]["config"]["database"], original["snowflake"]["config"]["database"]
+                )
+        self.assertEqual(checked, 45 + 45 + 38)
 
     def test_system_prompt_carries_the_example_and_the_user_message_carries_the_task(self) -> None:
         system, user = build_messages(self.task)

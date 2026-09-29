@@ -26,7 +26,12 @@ and one `elt/models/<mart>.sql` per mart, each in a
 `workspace-signal-v1`: 0 when Extract/Load fails, 0.5 when Extract/Load passes
 and no mart matches, up to 1.0 when every mart matches on every hidden
 population. A grader fault is not a reward: it discards the whole group, which
-is sampled again.
+is sampled again. If three attempts at a group all fault, the run stops rather
+than train on a smaller batch.
+
+The prompt holds the task's public files with credential values in
+`config.yaml` replaced by `<supplied as a Terraform variable>`; the grader
+requires credentials to be Terraform variables, so the model never needs them.
 
 ## Run
 
