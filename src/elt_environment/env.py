@@ -145,6 +145,9 @@ class GroupRetryExhausted(RuntimeError):
 class RetryWholeGroup(RolloutStrategy):
     """Discard the whole group when any rollout has no label, then sample a fresh group.
 
+    Every rollout of an attempt runs to completion before the next attempt
+    starts, so no grader from a discarded attempt is still running when the
+    fresh group is graded; a grade cannot outlast taskgen's grader deadline.
     No trajectory from a discarded attempt is kept, so a group is never a mix
     of attempts. After ``max_attempts`` discards, ``GroupRetryExhausted``
     propagates and stops the run, so the trainer never trains on a batch
@@ -167,27 +170,24 @@ class RetryWholeGroup(RolloutStrategy):
         errors: list[RolloutError] = []
         for _ in range(self.max_attempts):
             envs = await env_group_builder.make_envs()
-            rollouts = [asyncio.ensure_future(do_single_rollout(policy, env)) for env in envs]
-            try:
-                trajectories = await asyncio.gather(*rollouts)
-            except DiscardGroupSignal as signal:
-                await _cancel_all(rollouts)
-                errors.append(RolloutError(error_type="discard_group", error_message=signal.reason_code))
+            results = await asyncio.gather(
+                *(do_single_rollout(policy, env) for env in envs), return_exceptions=True
+            )
+            failures = [result for result in results if isinstance(result, BaseException)]
+            for failure in failures:
+                if not isinstance(failure, DiscardGroupSignal):
+                    raise failure
+            if failures:
+                errors.extend(
+                    RolloutError(error_type="discard_group", error_message=failure.reason_code)
+                    for failure in failures
+                )
                 continue
-            except BaseException:
-                await _cancel_all(rollouts)
-                raise
-            return RolloutResult(trajectories=list(trajectories), envs=envs, errors=errors)
+            return RolloutResult(trajectories=list(results), envs=envs, errors=errors)
         raise GroupRetryExhausted(
             f"{self.max_attempts} attempts each had a rollout without a label: "
             + ", ".join(error.error_message for error in errors)
         )
-
-
-async def _cancel_all(rollouts: Sequence[asyncio.Future]) -> None:
-    for rollout in rollouts:
-        rollout.cancel()
-    await asyncio.gather(*rollouts, return_exceptions=True)
 
 
 class EltDataset(RLDataset):
@@ -291,6 +291,7 @@ class EltDatasetBuilder(RLDatasetBuilder):
             taskgen_root=Path(self.taskgen_root),
             attempts_root=Path(self.attempts_root),
             grader_deadline_s=self.grader_deadline_s,
+            verify_release=self.verify_releases,
         )
 
         def builder(group_size: int) -> Callable[[TaskRef], EltGroupBuilder]:

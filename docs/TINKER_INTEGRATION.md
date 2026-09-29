@@ -107,14 +107,12 @@ Implement a custom pickleable Cookbook `RolloutStrategy` with this behavior:
 ```text
 for attempt in 1..max_attempts:
     envs = builder.make_envs()              # exactly group_size, all fresh
-    launch every single rollout
-    if any rollout raises DiscardGroupSignal:
-        cancel and await every sibling
+    run every single rollout to completion
+    if any rollout raised an unrelated exception:
+        fail loudly
+    if any rollout raised DiscardGroupSignal:
         retain no trajectory from this attempt
-        builder.cleanup()
         continue
-    if any unrelated exception occurs:
-        cancel/await siblings, clean up, fail loudly
     return the complete, labelled group
 raise GroupRetryExhausted
 ```
@@ -125,7 +123,9 @@ Important details:
 - use a distinct exhaustion exception, not Cookbook's
   `AllTrajectoriesFailedError`, which is caught and converted into a missing
   group;
-- await cancelled tasks before tearing down their resources;
+- let every sibling finish before the next attempt starts, so no grader
+  thread from a discarded attempt is still running when the fresh group is
+  graded; a grade cannot outlast taskgen's grader deadline;
 - verify that every successful result contains a finite reward in `[0,1]`;
 - never splice a previously successful sibling into a retry;
 - use the same task builder on retry, unless an owned outer trainer is

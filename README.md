@@ -26,8 +26,11 @@ and one `elt/models/<mart>.sql` per mart, each in a
 `workspace-signal-v1`: 0 when Extract/Load fails, 0.5 when Extract/Load passes
 and no mart matches, up to 1.0 when every mart matches on every hidden
 population. A grader fault is not a reward: it discards the whole group, which
-is sampled again. If three attempts at a group all fault, the run stops rather
-than train on a smaller batch.
+is sampled again. Every rollout of an attempt finishes before the group is
+sampled again, so no grader from a discarded attempt is still running. If
+three attempts at a group all fault, the run stops rather than train on a
+smaller batch. The release is checked against its checksums at admission and
+again before every grade.
 
 The prompt holds four of the task's public files: `documentation/README.md`,
 `config.yaml`, `data_model.yaml` and the starter `elt/main.tf`. Credential
@@ -43,6 +46,10 @@ needs them. The other public files are left out:
   rows equal the rows taskgen writes from that entry.
 - Other destinations, credential templates and the job-status script do not
   affect the reply.
+
+Any other file in the public tree, or a symlink anywhere in it, excludes the
+task from training. So does a credential value from any public config or
+credential file that remains in a shown file.
 
 ## Run
 

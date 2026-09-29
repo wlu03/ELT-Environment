@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -13,6 +14,7 @@ from elt_environment.prompt import (
     CREDENTIAL_PLACEHOLDER,
     EXAMPLE_REPLY,
     EXAMPLE_TASK_ID,
+    BundleLayoutError,
     BundleRedactionError,
     build_messages,
     bundle_files,
@@ -80,41 +82,104 @@ Source table orders.
 - `sku`: text NULL — Listed under another heading, so not a column of items.
 """
 SCHEMA_HEADER = "column_name,column_description\n"
+BUNDLE = {
+    "documentation/README.md": README_TABLES,
+    "documentation/source_postgres.md": "reference",
+    "documentation/destination_snowflake.md": "reference",
+    "config.yaml": (
+        "postgres:\n  config:\n    password: pg-secret-value\n"
+        "snowflake:\n  config:\n    database: d\n"
+    ),
+    "snowflake_credential.json": '{"account": "", "password": "wh-secret-value", "user": ""}',
+    "check_job_status.py": "print()\n",
+    "destinations/snowflake/README.md": "snowflake\n",
+    "destinations/snowflake/config.yaml": (
+        "snowflake:\n  config:\n    password: dest-secret-value\n"
+    ),
+    "destinations/snowflake/snowflake_credential.json": "{}\n",
+    "data_model.yaml": "models: []\n",
+    "elt/main.tf": "terraform {}\n",
+    "schemas/orders.csv": SCHEMA_HEADER + "id,Order id.\nnote,Free text. may be NULL.\n",
+    "schemas/items.csv": SCHEMA_HEADER + "id,Item id.\nsku,Stock unit.\n",
+    "schemas/customers.csv": SCHEMA_HEADER + "id,Customer id.\n",
+    "schemas/products.csv": (
+        SCHEMA_HEADER + "id,Product identifier.\nkind,Kind. always exactly one of 'a', 'b'.\n"
+    ),
+}
 
 
 class BundleSelectionTests(unittest.TestCase):
-    def test_readme_is_the_only_document_and_repeated_schemas_are_left_out(self) -> None:
+    def _task(self, root: str, files: dict[str, str]) -> TaskRef:
+        task = TaskRef(Path(root), "t", "f", "snowflake")
+        for relative, content in files.items():
+            (task.public_dir / relative).parent.mkdir(parents=True, exist_ok=True)
+            (task.public_dir / relative).write_text(content, encoding="utf-8")
+        return task
+
+    def test_documented_files_are_shown_or_skipped_and_repeated_schemas_are_left_out(self) -> None:
         with tempfile.TemporaryDirectory() as root:
-            task = TaskRef(Path(root), "t", "f", "snowflake")
-            files = {
-                "documentation/README.md": README_TABLES,
-                "documentation/source_postgres.md": "reference",
-                "documentation/destination_snowflake.md": "reference",
-                "config.yaml": "snowflake:\n  config:\n    database: d\n",
-                "schemas/orders.csv": (
-                    SCHEMA_HEADER + "id,Order id.\nnote,Free text. may be NULL.\n"
-                ),
-                "schemas/items.csv": SCHEMA_HEADER + "id,Item id.\nsku,Stock unit.\n",
-                "schemas/customers.csv": SCHEMA_HEADER + "id,Customer id.\n",
-                "schemas/products.csv": (
-                    SCHEMA_HEADER
-                    + "id,Product identifier.\nkind,Kind. always exactly one of 'a', 'b'.\n"
-                ),
-            }
-            for relative, content in files.items():
-                (task.public_dir / relative).parent.mkdir(parents=True, exist_ok=True)
-                (task.public_dir / relative).write_text(content, encoding="utf-8")
-            paths = [path for path, _ in bundle_files(task)]
+            shown = dict(bundle_files(self._task(root, BUNDLE)))
         self.assertEqual(
-            paths,
+            list(shown),
             [
                 "documentation/README.md",
                 "config.yaml",
+                "data_model.yaml",
+                "elt/main.tf",
                 "schemas/customers.csv",
                 "schemas/items.csv",
                 "schemas/products.csv",
             ],
         )
+        self.assertNotIn("pg-secret-value", shown["config.yaml"])
+
+    def test_an_undocumented_file_or_a_symlink_refuses_the_bundle(self) -> None:
+        cases = {
+            "root file": lambda public: (public / "notes.txt").write_text("x"),
+            "nested file": lambda public: (public / "elt" / "secrets.yaml").write_text("x"),
+            "linked directory": lambda public: os.symlink(public.parent, public / "linked"),
+            "linked file": lambda public: os.symlink(
+                public / "config.yaml", public / "documentation" / "link.md"
+            ),
+        }
+        for name, tamper in cases.items():
+            with tempfile.TemporaryDirectory() as root, self.subTest(case=name):
+                task = self._task(root, BUNDLE)
+                tamper(task.public_dir)
+                with self.assertRaises(BundleLayoutError):
+                    bundle_files(task)
+
+    def test_a_credential_value_in_any_shown_file_refuses_the_bundle(self) -> None:
+        for relative, content in (
+            ("documentation/README.md", README_TABLES + "\nThe password is pg-secret-value.\n"),
+            ("data_model.yaml", "models: []\nnote: wh-secret-value\n"),
+            ("elt/main.tf", 'terraform {}\nlocals { x = "dest-secret-value" }\n'),
+        ):
+            files = dict(BUNDLE, **{relative: content})
+            with tempfile.TemporaryDirectory() as root, self.subTest(file=relative):
+                with self.assertRaises(BundleRedactionError):
+                    bundle_files(self._task(root, files))
+
+    def test_a_credential_value_too_short_to_search_for_does_not_refuse_the_bundle(self) -> None:
+        files = dict(
+            BUNDLE,
+            **{
+                "config.yaml": "aws_s3:\n  AWS_ACCESS_KEY_ID: test\n",
+                "documentation/README.md": README_TABLES + "\nA test of the bundle.\n",
+            },
+        )
+        with tempfile.TemporaryDirectory() as root:
+            shown = dict(bundle_files(self._task(root, files)))
+        self.assertIn("A test of the bundle.", shown["documentation/README.md"])
+        self.assertNotIn("test", shown["config.yaml"])
+
+    def test_credential_keys_in_every_yaml_file_are_redacted(self) -> None:
+        data_model = "models:\n- name: m\n  api_token: model-secret\n"
+        files = dict(BUNDLE, **{"data_model.yaml": data_model})
+        with tempfile.TemporaryDirectory() as root:
+            shown = dict(bundle_files(self._task(root, files)))
+        model = yaml.safe_load(shown["data_model.yaml"])["models"][0]
+        self.assertEqual(model["api_token"], CREDENTIAL_PLACEHOLDER)
 
 
 def _attribute_paths(main_tf: str) -> set[tuple[str, ...]]:

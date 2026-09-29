@@ -24,9 +24,10 @@ class ScriptedPolicy(TokenCompleter):
 
 
 class ScriptedEnv(Env):
-    def __init__(self, outcome: object, attempt: int) -> None:
+    def __init__(self, outcome: object, attempt: int, log: list | None = None) -> None:
         self.outcome = outcome
         self.attempt = attempt
+        self.log = log
 
     async def initial_observation(self) -> tuple[tinker.ModelInput, StopCondition]:
         return tinker.ModelInput.from_ints([1]), []
@@ -34,6 +35,9 @@ class ScriptedEnv(Env):
     async def step(self, action, *, extra=None) -> StepResult:
         if isinstance(self.outcome, BaseException):
             raise self.outcome
+        if self.log is not None:
+            await asyncio.sleep(0.05)
+            self.log.append(("step", self.attempt))
         return StepResult(
             reward=float(self.outcome),
             episode_done=True,
@@ -47,11 +51,14 @@ class ScriptedEnv(Env):
 class ScriptedBuilder(EnvGroupBuilder):
     plan: list[list[object]]
     calls: int = field(default=0)
+    log: list | None = None
 
     async def make_envs(self) -> Sequence[Env]:
         outcomes = self.plan[min(self.calls, len(self.plan) - 1)]
         self.calls += 1
-        return [ScriptedEnv(outcome, self.calls) for outcome in outcomes]
+        if self.log is not None:
+            self.log.append(("make", self.calls))
+        return [ScriptedEnv(outcome, self.calls, self.log) for outcome in outcomes]
 
 
 def _run(strategy: RetryWholeGroup, builder: ScriptedBuilder):
@@ -76,6 +83,15 @@ class RetryWholeGroupTests(unittest.TestCase):
         self.assertEqual({t.transitions[-1].metrics["attempt"] for t in result.trajectories}, {2})
         self.assertEqual([t.transitions[-1].reward for t in result.trajectories], [0.0, 0.0, 0.5, 1.0])
         self.assertEqual([e.error_message for e in result.errors], ["grader_child_died"])
+
+    def test_every_sibling_finishes_before_the_group_is_sampled_again(self) -> None:
+        log: list[tuple[str, int]] = []
+        builder = ScriptedBuilder(
+            [[1.0, DiscardGroupSignal("tool_deadline"), 0.5, 0.0], [0.0, 0.0, 0.5, 1.0]], log=log
+        )
+        _run(RetryWholeGroup(max_attempts=3), builder)
+        expected = [("make", 1)] + [("step", 1)] * 3 + [("make", 2)] + [("step", 2)] * 4
+        self.assertEqual(log, expected)
 
     def test_numeric_zero_is_a_label_and_is_not_retried(self) -> None:
         builder = ScriptedBuilder([[0.0, 0.0, 0.0, 0.0]])

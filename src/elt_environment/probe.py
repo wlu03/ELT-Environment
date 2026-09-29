@@ -82,7 +82,11 @@ async def probe(config: ProbeConfig) -> dict:
     else:
         chosen = train[:: max(1, len(train) // config.tasks)][: config.tasks]
     out_dir = Path(config.out_dir or STATE_ROOT / "probes" / datetime.now().strftime("%Y%m%d-%H%M%S"))
-    grader = GraderConfig(taskgen_root=Path(config.taskgen_root), attempts_root=STATE_ROOT / "attempts")
+    grader = GraderConfig(
+        taskgen_root=Path(config.taskgen_root),
+        attempts_root=STATE_ROOT / "attempts",
+        verify_release=config.verify_releases,
+    )
     service = tinker.ServiceClient()
     sampling = await service.create_sampling_client_async(
         model_path=config.model_path, base_model=None if config.model_path else config.model_name

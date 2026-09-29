@@ -27,6 +27,7 @@ class GraderConfig:
     attempts_root: Path
     grader_deadline_s: float | None = None
     w_t: float = 1.0
+    verify_release: bool = True
 
     def runtime_config(self) -> DbtRuntimeConfig:
         image = Path(self.taskgen_root) / "runtime-images" / "dbt-duckdb"
@@ -54,8 +55,10 @@ def grade_artifact(task: TaskRef, files: Mapping[str, str], config: GraderConfig
 
     Returns ``DiscardGroup`` when the grader produced no label, which happens
     only for task, harness or infrastructure faults, or when the grader raised.
-    The exception is logged here and the group is sampled again. Blocks for the
-    length of one grade, so callers run it in a worker thread.
+    The exception is logged here and the group is sampled again. With
+    ``config.verify_release`` the release is checked against its checksums
+    before every grade, so a release changed after admission is never scored.
+    Blocks for the length of one grade, so callers run it in a worker thread.
     """
 
     Path(config.attempts_root).mkdir(parents=True, exist_ok=True)
@@ -65,7 +68,7 @@ def grade_artifact(task: TaskRef, files: Mapping[str, str], config: GraderConfig
         runtime_config=config.runtime_config(),
         grader_deadline_s=config.grader_deadline_s,
         w_t=config.w_t,
-        verify_release=False,
+        verify_release=config.verify_release,
     )
     try:
         env.reset(task.task_id)
