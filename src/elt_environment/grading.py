@@ -41,43 +41,52 @@ def _reason_code(code: str) -> str:
     return code if _REASON_CODE.fullmatch(code) else "harness_fault"
 
 
-def _close(env: DeclarativeEltEnv, task_id: str) -> None:
-    """Remove the episode directory. A failure here is logged and does not change the outcome."""
+class GraderCleanupError(RuntimeError):
+    """An attempt directory could not be removed; the run stops before more accumulate."""
 
+
+def _close(env: DeclarativeEltEnv, task_id: str) -> None:
     try:
         env.close()
-    except Exception:
-        logger.exception("grader cleanup failed on %s", task_id)
+    except Exception as error:
+        raise GraderCleanupError(
+            f"the attempt directory for {task_id} could not be removed"
+        ) from error
 
 
 def grade_artifact(task: TaskRef, files: Mapping[str, str], config: GraderConfig) -> GraderOutcome:
     """Seal ``files`` into a fresh attempt and score them on every hidden population.
 
     Returns ``DiscardGroup`` when the grader produced no label, which happens
-    only for task, harness or infrastructure faults, or when the grader raised.
-    The exception is logged here and the group is sampled again. With
-    ``config.verify_release`` the release is checked against its checksums
-    before every grade, so a release changed after admission is never scored.
-    Blocks for the length of one grade, so callers run it in a worker thread.
+    only for task, harness or infrastructure faults, or when anything from
+    creating the attempts directory to scoring raised. The exception is logged
+    here and the group is sampled again; an error outside this function is a
+    coordinator error and propagates. With ``config.verify_release`` the
+    release is checked against its checksums before every grade, so a release
+    changed after admission is never scored. An attempt directory that cannot
+    be removed raises ``GraderCleanupError``, which stops the run. Blocks for
+    the length of one grade, so callers run it in a worker thread.
     """
 
-    Path(config.attempts_root).mkdir(parents=True, exist_ok=True)
-    env = DeclarativeEltEnv(
-        task.release_dir,
-        attempts_root=Path(config.attempts_root),
-        runtime_config=config.runtime_config(),
-        grader_deadline_s=config.grader_deadline_s,
-        w_t=config.w_t,
-        verify_release=config.verify_release,
-    )
+    env: DeclarativeEltEnv | None = None
     try:
+        Path(config.attempts_root).mkdir(parents=True, exist_ok=True)
+        env = DeclarativeEltEnv(
+            task.release_dir,
+            attempts_root=Path(config.attempts_root),
+            runtime_config=config.runtime_config(),
+            grader_deadline_s=config.grader_deadline_s,
+            w_t=config.w_t,
+            verify_release=config.verify_release,
+        )
         env.reset(task.task_id)
         step = env.step(dict(files))
     except Exception:
         logger.exception("grader raised on %s", task.task_id)
         return DiscardGroup("grader_exception")
     finally:
-        _close(env, task.task_id)
+        if env is not None:
+            _close(env, task.task_id)
     signal = step.signal
     if not signal.label_valid or signal.reward is None:
         return DiscardGroup(_reason_code(step.harness_fault_code or "unlabelled"))

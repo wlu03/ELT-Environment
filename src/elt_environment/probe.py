@@ -15,6 +15,7 @@ import collections
 import json
 import logging
 import os
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
@@ -27,7 +28,7 @@ from tinker_cookbook.rl.rollouts import do_group_rollout
 from elt_environment.admission import admit_tasks
 from elt_environment.env import EltGroupBuilder, GroupRetryExhausted, RetryWholeGroup, cached_renderer
 from elt_environment.grading import GraderConfig
-from elt_environment.tasks import discover_tasks, split_by_family
+from elt_environment.tasks import TaskRef, discover_tasks, split_by_family
 from elt_environment.train import (
     DEFAULT_MODEL,
     DEFAULT_RELEASES,
@@ -63,9 +64,33 @@ class ProbeConfig:
     out_dir: str | None = None
 
 
+def choose_tasks(train: Sequence[TaskRef], count: int, task_ids: str | None) -> list[TaskRef]:
+    """Return the tasks named in ``task_ids``, or ``count`` tasks spread evenly over ``train``.
+
+    A name that is not an admitted training task, a count below one, or an
+    empty choice raises ``ValueError`` before any sampling starts.
+    """
+
+    if task_ids:
+        wanted = set(task_ids.split(","))
+        chosen = [task for task in train if task.task_id in wanted]
+        missing = wanted - {task.task_id for task in chosen}
+        if missing:
+            raise ValueError(f"not admitted training tasks: {', '.join(sorted(missing))}")
+    else:
+        if count < 1:
+            raise ValueError("tasks must be at least 1")
+        chosen = train[:: max(1, len(train) // count)][:count]
+    if not chosen:
+        raise ValueError("no training task to probe")
+    return chosen
+
+
 async def probe(config: ProbeConfig) -> dict:
     """Grade ``samples`` replies for each chosen training task and summarize the rewards."""
 
+    if config.samples < 1:
+        raise ValueError("samples must be at least 1")
     renderer_name = config.renderer_name or default_renderer_name(config.model_name)
     renderer = cached_renderer(config.model_name, renderer_name)
     admitted, _ = admit_tasks(
@@ -76,11 +101,7 @@ async def probe(config: ProbeConfig) -> dict:
         verify=config.verify_releases,
     )
     train, _ = split_by_family([a.task for a in admitted], config.eval_families, config.seed)
-    if config.task_ids:
-        wanted = set(config.task_ids.split(","))
-        chosen = [task for task in train if task.task_id in wanted]
-    else:
-        chosen = train[:: max(1, len(train) // config.tasks)][: config.tasks]
+    chosen = choose_tasks(train, config.tasks, config.task_ids)
     out_dir = Path(config.out_dir or STATE_ROOT / "probes" / datetime.now().strftime("%Y%m%d-%H%M%S"))
     grader = GraderConfig(
         taskgen_root=Path(config.taskgen_root),

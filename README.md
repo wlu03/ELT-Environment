@@ -30,7 +30,8 @@ is sampled again. Every rollout of an attempt finishes before the group is
 sampled again, so no grader from a discarded attempt is still running. If
 three attempts at a group all fault, the run stops rather than train on a
 smaller batch. The release is checked against its checksums at admission and
-again before every grade.
+again before every grade. An attempt directory that cannot be removed also
+stops the run.
 
 The prompt holds four of the task's public files: `documentation/README.md`,
 `config.yaml`, `data_model.yaml` and the starter `elt/main.tf`. Credential

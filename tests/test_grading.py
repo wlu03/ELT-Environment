@@ -13,7 +13,7 @@ from elt_taskgen.training.canonical import render_canonical_project
 
 from elt_environment.artifact import format_artifact
 from elt_environment.env import EltGroupBuilder
-from elt_environment.grading import GraderConfig, grade_artifact
+from elt_environment.grading import GraderCleanupError, GraderConfig, grade_artifact
 from elt_environment.outcomes import DiscardGroup, ValidReward
 from elt_environment.tasks import TaskRef, discover_tasks
 from elt_environment.train import DEFAULT_MODEL, default_renderer_name
@@ -104,7 +104,16 @@ class GraderExceptionTests(unittest.TestCase):
         self.assertEqual(outcome, DiscardGroup("grader_exception"))
         self.assertEqual(closed, [True])
 
-    def test_a_cleanup_failure_keeps_the_reward(self) -> None:
+    def test_a_constructor_failure_discards_the_group_and_closes_nothing(self) -> None:
+        class Unbuildable:
+            def __init__(self, *args, **kwargs) -> None:
+                raise OSError("runtime image unavailable")
+
+        with self.assertLogs("elt_environment.grading", "ERROR"):
+            outcome = self._grade(Unbuildable)
+        self.assertEqual(outcome, DiscardGroup("grader_exception"))
+
+    def test_a_cleanup_failure_stops_the_run(self) -> None:
         class LeakyClose:
             def __init__(self, *args, **kwargs) -> None:
                 pass
@@ -127,10 +136,8 @@ class GraderExceptionTests(unittest.TestCase):
             def close(self) -> None:
                 raise OSError("busy")
 
-        with self.assertLogs("elt_environment.grading", "ERROR"):
-            outcome = self._grade(LeakyClose)
-        self.assertIsInstance(outcome, ValidReward)
-        self.assertEqual(outcome.value, 0.5)
+        with self.assertRaises(GraderCleanupError):
+            self._grade(LeakyClose)
 
 
 if __name__ == "__main__":
