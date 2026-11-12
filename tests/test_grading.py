@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import os
 import tempfile
 import unittest
@@ -11,8 +10,6 @@ from unittest import mock
 from elt_taskgen.training import load_workspace_package
 from elt_taskgen.training.canonical import render_canonical_project
 
-from elt_environment.artifact import format_artifact
-from elt_environment.env import EltGroupBuilder
 from elt_environment.grading import GraderCleanupError, GraderConfig, grade_artifact
 from elt_environment.outcomes import DiscardGroup, ValidReward
 from elt_environment.tasks import TaskRef, discover_tasks
@@ -50,32 +47,6 @@ class GradingTests(unittest.TestCase):
         self.assertEqual(outcome.metrics["phase_none"], 1.0)
         self.assertEqual(list((Path(self.scratch.name) / "episodes").iterdir()), [])
 
-    def test_env_step_decodes_a_sampled_reply_and_grades_it(self) -> None:
-        builder = EltGroupBuilder(
-            task=self.task,
-            group_size=2,
-            model_name=MODEL,
-            renderer_name=RENDERER,
-            grader=self.grader,
-            grader_concurrency=2,
-        )
-
-        async def run() -> tuple[float, float, dict, dict]:
-            good_env, bad_env = await builder.make_envs()
-            await good_env.initial_observation()
-            tokenizer = good_env.renderer.tokenizer
-            stop = good_env.stop_condition
-            end = list(stop) if stop and isinstance(stop[0], int) else tokenizer.encode(stop[0])
-            good = tokenizer.encode(format_artifact(self.canonical), add_special_tokens=False) + end
-            bad = tokenizer.encode("I cannot write this project.", add_special_tokens=False) + end
-            good_result, bad_result = await asyncio.gather(good_env.step(good), bad_env.step(bad))
-            return good_result.reward, bad_result.reward, good_result.metrics, bad_result.metrics
-
-        good_reward, bad_reward, good_metrics, bad_metrics = asyncio.run(run())
-        self.assertEqual(good_reward, 1.0)
-        self.assertEqual(good_metrics["format_error"], 0.0)
-        self.assertEqual(bad_reward, 0.0)
-        self.assertEqual(bad_metrics["format_error"], 1.0)
 
 
 class GraderExceptionTests(unittest.TestCase):

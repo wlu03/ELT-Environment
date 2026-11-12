@@ -2,7 +2,7 @@
 
 Example::
 
-    .venv/bin/python -m elt_environment.train max_steps=20
+    See README.md for runtime and grader configuration.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 from datetime import datetime
 from pathlib import Path
 
@@ -18,10 +19,12 @@ from tinker_cookbook import cli_utils, model_info
 from tinker_cookbook.rl.train import Config, main
 
 from elt_environment.env import EltDatasetBuilder, RetryWholeGroup
+from elt_environment.runner import AgentConfig, preflight
+from elt_environment.tasks import discover_tasks
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 TASKGEN_ROOT = PROJECT_ROOT.parent / "ELT-taskgen"
-DEFAULT_RELEASES = TASKGEN_ROOT / "runs" / "batch50c_20260923" / "workspace" / "releases"
+DEFAULT_RELEASES = PROJECT_ROOT / "training-data"
 STATE_ROOT = PROJECT_ROOT / ".state"
 DEFAULT_MODEL = "Qwen/Qwen3.8-27B"
 
@@ -33,6 +36,17 @@ class CLIConfig:
     """Command-line settings for one training run."""
 
     releases_root: str = str(DEFAULT_RELEASES)
+    agent: str = "spider"
+    inputs_root: str = ""
+    agent_python: str = AgentConfig().python
+    max_turns: int = 100
+    agent_timeout_s: float = 7200
+    agent_image: str | None = None
+    agent_network: str = "elt-docker_elt_network"
+    bridge_bind_host: str = "127.0.0.1"
+    bridge_container_host: str = "host.docker.internal"
+    grader_command: str = ""
+    allow_declarative_grader: bool = False
     taskgen_root: str = str(TASKGEN_ROOT)
     model_name: str = DEFAULT_MODEL
     renderer_name: str | None = None
@@ -73,11 +87,7 @@ def load_env_file(path: Path) -> None:
 
 
 def default_renderer_name(model_name: str) -> str:
-    """Return the recommended renderer with thinking turned off when the model offers one.
-
-    The prompt is up to about 55,000 tokens, so a 64K context leaves no room
-    for long reasoning before the reply.
-    """
+    """Return the recommended renderer, preferring its non-thinking variant."""
 
     names = model_info.get_recommended_renderer_names(model_name)
     without_thinking = [name for name in names if name.endswith("disable_thinking")]
@@ -108,6 +118,8 @@ def build_config(cli: CLIConfig) -> Config:
         context_length=cli.context_length,
         grader_concurrency=cli.grader_concurrency,
         verify_releases=cli.verify_releases,
+        agent=agent_config(cli),
+        grader_command=tuple(shlex.split(cli.grader_command)),
     )
     return Config(
         learning_rate=cli.learning_rate,
@@ -131,12 +143,42 @@ def build_config(cli: CLIConfig) -> Config:
 
 async def cli_main(cli: CLIConfig) -> None:
     load_env_file(PROJECT_ROOT / ".env")
+    check_run(cli)
     if not os.environ.get("TINKER_API_KEY"):
         raise SystemExit("TINKER_API_KEY is not set; put it in .env or the environment")
     config = build_config(cli)
     cli_utils.check_log_dir(config.log_path, behavior_if_exists=cli.behavior_if_log_dir_exists)
     logger.info("log path: %s", config.log_path)
     await main(config)
+
+
+def agent_config(cli) -> AgentConfig:
+    return AgentConfig(
+        agent=cli.agent,
+        inputs_root=cli.inputs_root,
+        python=cli.agent_python,
+        max_turns=cli.max_turns,
+        max_tokens=cli.max_tokens,
+        context_length=cli.context_length,
+        timeout_s=cli.agent_timeout_s,
+        image=cli.agent_image,
+        network=cli.agent_network,
+        bridge_bind_host=cli.bridge_bind_host,
+        bridge_container_host=cli.bridge_container_host,
+    )
+
+
+def check_run(cli):
+    """Reject unavailable runtimes and ambiguous grading before a paid API call."""
+    if not cli.grader_command and not cli.allow_declarative_grader:
+        raise ValueError(
+            "set grader_command to your trusted hidden-replay grader; "
+            "allow_declarative_grader=true selects the restricted offline scorer"
+        )
+    tasks = discover_tasks(Path(cli.releases_root))
+    if not tasks:
+        raise ValueError("no task releases found")
+    preflight(agent_config(cli), tasks)
 
 
 if __name__ == "__main__":
