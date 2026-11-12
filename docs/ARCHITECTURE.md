@@ -1,5 +1,9 @@
 # Environment architecture
 
+> Historical design notes: the single-reply pilot described below has been
+> replaced by the vendored-agent provider bridge. See [README](../README.md)
+> for the implemented flow, runtime requirements and current grading limits.
+
 ## Decision
 
 Build `ELT-Environment` as a thin Tinker coordinator around the verified

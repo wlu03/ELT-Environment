@@ -1,5 +1,9 @@
 # Tinker and GRPO integration contract
 
+> Historical design notes: the single-reply pilot described below has been
+> replaced by the vendored-agent provider bridge. See [README](../README.md)
+> for the implemented flow, runtime requirements and current grading limits.
+
 This records the current API assumptions reviewed on 2026-09-06. Re-audit them
 when changing either pin.
 
