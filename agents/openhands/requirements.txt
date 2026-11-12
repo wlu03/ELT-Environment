@@ -1,0 +1,9 @@
+openhands-sdk==1.19.1
+openhands-tools==1.19.1
+pydantic
+snowflake-connector-python>=3.0
+databricks-sql-connector
+databricks-sdk
+redshift-connector
+PyYAML
+lmnr==0.7.47
