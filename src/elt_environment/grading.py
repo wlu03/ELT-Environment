@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+import signal
+import subprocess
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -28,6 +33,7 @@ class GraderConfig:
     grader_deadline_s: float | None = None
     w_t: float = 1.0
     verify_release: bool = True
+    command: tuple[str, ...] = ()
 
     def runtime_config(self) -> DbtRuntimeConfig:
         image = Path(self.taskgen_root) / "runtime-images" / "dbt-duckdb"
@@ -68,6 +74,8 @@ def grade_artifact(task: TaskRef, files: Mapping[str, str], config: GraderConfig
     the length of one grade, so callers run it in a worker thread.
     """
 
+    if config.command:
+        return grade_command(task, files, config)
     env: DeclarativeEltEnv | None = None
     try:
         Path(config.attempts_root).mkdir(parents=True, exist_ok=True)
@@ -96,5 +104,63 @@ def grade_artifact(task: TaskRef, files: Mapping[str, str], config: GraderConfig
         "el_pass": float(signal.el_pass),
         "policy_violation": float(signal.policy_violation),
     }
-    metrics.update({f"phase_{phase}": float(signal.first_failed_phase == phase) for phase in _PHASES})
+    metrics.update(
+        {f"phase_{phase}": float(signal.first_failed_phase == phase) for phase in _PHASES}
+    )
     return ValidReward(signal.reward, metrics)
+
+
+def grade_command(task: TaskRef, files: Mapping[str, str], config: GraderConfig) -> GraderOutcome:
+    """Invoke an operator-configured hidden-replay grader outside the agent.
+
+    The command gets one JSON request path and writes an outcome JSON object
+    to stdout. It must replay the artifact on fresh hidden populations, rather
+    than reward success on the agent-visible development warehouse.
+    """
+    try:
+        from elt_taskgen.training import load_workspace_package
+
+        load_workspace_package(task.release_dir, task.task_id, verify=config.verify_release)
+        config.attempts_root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with tempfile.TemporaryDirectory(prefix="grade-", dir=config.attempts_root) as directory:
+            root = Path(directory)
+            request = root / "request.json"
+            request.write_text(
+                json.dumps(
+                    {
+                        "task_id": task.task_id,
+                        "release_dir": str(task.release_dir.resolve()),
+                        "destination": task.destination,
+                        "files": dict(files),
+                    }
+                )
+            )
+            request.chmod(0o600)
+            with (root / "stdout").open("w+b") as stdout, (root / "stderr").open("w+b") as stderr:
+                process = subprocess.Popen(
+                    [*config.command, str(request)],
+                    stdout=stdout,
+                    stderr=stderr,
+                    start_new_session=True,
+                )
+                try:
+                    process.wait(timeout=config.grader_deadline_s or 7200)
+                except subprocess.TimeoutExpired:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
+                    return DiscardGroup("grader_timeout")
+                if process.returncode:
+                    return DiscardGroup("grader_command_failed")
+                stdout.seek(0)
+                raw = stdout.read(65537)
+            if len(raw) > 65536:
+                return DiscardGroup("grader_response_invalid")
+            value = json.loads(raw)
+            if value.get("label_valid") is False:
+                return DiscardGroup(_reason_code(value.get("reason_code", "unlabelled")))
+            if value.get("label_valid") is not True:
+                return DiscardGroup("grader_response_invalid")
+            return ValidReward(value["reward"], value.get("metrics", {}))
+    except Exception:
+        logger.exception("trusted grader command failed for %s", task.task_id)
+        return DiscardGroup("grader_exception")
