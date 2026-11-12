@@ -16,6 +16,11 @@ attempts/
 checkpoints/
 rollouts/
 logs/
+/testing/
+
+# Local task inputs, including evaluator-private data.
+/training-data/*
+!/training-data/.gitkeep
 
 # Credentials must be injected, never committed.
 .env
