@@ -1,114 +1,88 @@
 from __future__ import annotations
 
-import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
-from unittest import mock
 
-from elt_taskgen.training import load_workspace_package
-from elt_taskgen.training.canonical import render_canonical_project
+from task_fixtures import write_bundle
 
-from elt_environment.grading import GraderCleanupError, GraderConfig, grade_artifact
+from elt_environment.grading import GraderConfig, grade_artifact
 from elt_environment.outcomes import DiscardGroup, ValidReward
-from elt_environment.tasks import TaskRef, discover_tasks
-from elt_environment.train import DEFAULT_MODEL, default_renderer_name
-
-TASKGEN = Path(__file__).resolve().parents[2] / "ELT-taskgen"
-RELEASES = TASKGEN / "runs" / "batch50c_20260923" / "workspace" / "releases"
-TASK_ID = "synsql__3d_motion_tracking_and_analysis__sensors_motion_data_cohorts"
-MODEL = DEFAULT_MODEL
-RENDERER = default_renderer_name(DEFAULT_MODEL)
+from elt_environment.tasks import discover_tasks
+from elt_environment.train import CLIConfig, check_run
 
 
-@unittest.skipUnless(
-    os.environ.get("ELT_ENVIRONMENT_GRADING_TESTS") == "1" and RELEASES.is_dir(),
-    "set ELT_ENVIRONMENT_GRADING_TESTS=1 to run real dbt grading",
-)
-class GradingTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls) -> None:
-        cls.task = next(t for t in discover_tasks(RELEASES) if t.task_id == TASK_ID)
-        package = load_workspace_package(cls.task.release_dir, TASK_ID, verify=False)
-        cls.canonical = render_canonical_project(package)
-        cls.scratch = tempfile.TemporaryDirectory()
-        cls.grader = GraderConfig(taskgen_root=TASKGEN, attempts_root=Path(cls.scratch.name))
+class CommandGraderTests(unittest.TestCase):
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        write_bundle(self.root / "bundle")
+        (self.task,) = discover_tasks(self.root / "bundle")
 
-    @classmethod
-    def tearDownClass(cls) -> None:
-        cls.scratch.cleanup()
+    def grade(self, program, *, deadline=10):
+        script = self.root / "grader.py"
+        script.write_text(program)
+        config = GraderConfig(
+            attempts_root=self.root / "attempts",
+            command=(sys.executable, str(script)),
+            grader_deadline_s=deadline,
+        )
+        outcome = grade_artifact(self.task, {"elt/main.tf": "terraform {}"}, config)
+        self.assertEqual(list(config.attempts_root.iterdir()), [])
+        return outcome
 
-    def test_canonical_artifact_scores_one_and_leaves_no_attempt_behind(self) -> None:
-        outcome = grade_artifact(self.task, self.canonical, self.grader)
-        self.assertIsInstance(outcome, ValidReward)
-        self.assertEqual(outcome.value, 1.0)
-        self.assertEqual(outcome.metrics["el_pass"], 1.0)
-        self.assertEqual(outcome.metrics["phase_none"], 1.0)
-        self.assertEqual(list((Path(self.scratch.name) / "episodes").iterdir()), [])
+    def test_command_receives_artifact_and_returns_reward_without_release_metadata(self):
+        outcome = self.grade("""import json, os, sys
+from pathlib import Path
+request = Path(sys.argv[1])
+assert request.stat().st_mode & 0o777 == 0o600
+payload = json.loads(request.read_text())
+assert payload['task_id'] == 't'
+assert payload['destination'] == 'snowflake'
+assert payload['files'] == {'elt/main.tf': 'terraform {}'}
+assert sorted(os.listdir(payload['release_dir'])) == ['private', 'public']
+print(json.dumps({'label_valid': True, 'reward': .75, 'metrics': {'r_t': .5}}))
+""")
+        self.assertEqual(outcome, ValidReward(0.75, {"r_t": 0.5}))
 
+    def test_faults_are_discarded_and_private_requests_are_cleaned(self):
+        for program, code in (
+            (
+                'print(\'{"label_valid": false, "reason_code": "warehouse_down"}\')',
+                "warehouse_down",
+            ),
+            ('print(\'{"label_valid": false, "reason_code": "private/path"}\')', "harness_fault"),
+            ("print('{}')", "grader_response_invalid"),
+            ("print('x' * 65537)", "grader_response_invalid"),
+            ("raise SystemExit(1)", "grader_command_failed"),
+        ):
+            with self.subTest(code=code):
+                self.assertEqual(self.grade(program), DiscardGroup(code))
 
+    def test_timeout_kills_grader_and_cleans_request(self):
+        self.assertEqual(
+            self.grade("import time; time.sleep(10)", deadline=0.05), DiscardGroup("grader_timeout")
+        )
 
-class GraderExceptionTests(unittest.TestCase):
-    def _grade(self, fake_env: type) -> object:
-        task = TaskRef(Path("/nonexistent"), "t", "f", "snowflake")
-        with tempfile.TemporaryDirectory() as scratch:
-            grader = GraderConfig(taskgen_root=TASKGEN, attempts_root=Path(scratch))
-            with mock.patch("elt_environment.grading.DeclarativeEltEnv", fake_env):
-                return grade_artifact(task, {"main.tf": ""}, grader)
-
-    def test_an_exception_from_the_grader_discards_the_group_and_still_closes(self) -> None:
-        closed = []
-
-        class Raising:
-            def __init__(self, *args, **kwargs) -> None:
-                pass
-
-            def reset(self, task_id: str) -> None:
-                raise OSError("disk full")
-
-            def close(self) -> None:
-                closed.append(True)
-
+    def test_changed_task_metadata_is_refused_before_running_grader(self):
+        write_bundle(self.task.release_dir, family="changed")
+        config = GraderConfig(self.root / "attempts", ("nonexistent-grader",))
         with self.assertLogs("elt_environment.grading", "ERROR"):
-            outcome = self._grade(Raising)
+            outcome = grade_artifact(self.task, {}, config)
         self.assertEqual(outcome, DiscardGroup("grader_exception"))
-        self.assertEqual(closed, [True])
+        self.assertFalse(config.attempts_root.exists())
 
-    def test_a_constructor_failure_discards_the_group_and_closes_nothing(self) -> None:
-        class Unbuildable:
-            def __init__(self, *args, **kwargs) -> None:
-                raise OSError("runtime image unavailable")
-
-        with self.assertLogs("elt_environment.grading", "ERROR"):
-            outcome = self._grade(Unbuildable)
-        self.assertEqual(outcome, DiscardGroup("grader_exception"))
-
-    def test_a_cleanup_failure_stops_the_run(self) -> None:
-        class LeakyClose:
-            def __init__(self, *args, **kwargs) -> None:
-                pass
-
-            def reset(self, task_id: str) -> None:
-                pass
-
-            def step(self, files: dict) -> SimpleNamespace:
-                signal = SimpleNamespace(
-                    label_valid=True,
-                    reward=0.5,
-                    r_el=1.0,
-                    r_t=0.0,
-                    el_pass=True,
-                    policy_violation=False,
-                    first_failed_phase="mart",
-                )
-                return SimpleNamespace(signal=signal, harness_fault_code="")
-
-            def close(self) -> None:
-                raise OSError("busy")
-
-        with self.assertRaises(GraderCleanupError):
-            self._grade(LeakyClose)
+    def test_missing_command_is_rejected_before_sampling(self):
+        with self.assertRaisesRegex(ValueError, "grader command"):
+            GraderConfig(self.root, ())
+        for command in ("", "   "):
+            with (
+                self.subTest(command=command),
+                self.assertRaisesRegex(ValueError, "grader_command"),
+            ):
+                check_run(CLIConfig(grader_command=command))
 
 
 if __name__ == "__main__":

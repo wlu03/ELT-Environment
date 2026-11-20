@@ -16,7 +16,7 @@ uv sync
 TINKER_API_KEY=urapikey
 TINKER_PROJECT_ID=urprojectid
 ```
-3. Put your `training-data/<name>`. Keep each training data the same as `ELT-taskgen`. Visit that [repo](github.com/wlu03/ELT-taskgen). `public/` should be the agent facing files and `private/` keeps all of the verifiers and evaluators. 
+3. Put taskgen bundles under `training-data/<name>/`, with matching `public/<task_id>/` and `private/<task_id>/` directories. Discovery reads `family_id` from private `task_ir.json` (or `semantic/task_ir.json`) and the destination from public `config.yaml`. Public EL/T variants without a private parent record are not separate training examples. You can also point `releases_root` at a single bundle.
 
 4. Install the Codex runner's requirements in a separate Python env. Build its `elt-swe` Docker image using the instructions under `agents/`. Pass the environment's Python interpreter as `agent_python`. 
 
@@ -93,11 +93,11 @@ Faults discard and resample the entire GRPO group; they never become zero reward
 The grader request, release private tree and results stay outside the agent mount.
 The agent sees only the installed task workspace and its development services.
 
-For an explicit **offline diagnostic**, omit `grader_command` and set
-`allow_declarative_grader=true`. This selects the existing taskgen DuckDB replay
-scorer. It enforces a narrower Terraform/SQL contract than the copied agents:
-valid real-cloud solutions can fail this scorer. It should not be used to claim
-ELT-Bench-equivalent pass rates. There is no silent fallback to it.
+`grader_command` is required for training and probes. The grader owns validation
+of private replay assets and must report missing or invalid assets as an
+unlabelled outcome. Admission checks task metadata and installed development
+inputs; it does not certify hidden replay assets. Keep bundles immutable during
+a run. There is no bundled offline diagnostic scorer.
 
 ## Checks and limits
 
@@ -131,7 +131,7 @@ src/elt_environment/
   bridge.py                   provider requests <-> Tinker observations/actions
   runner.py                   workspace, runtime lock, process and container cleanup
   env.py                      multi-turn Cookbook environment and group retries
-  grading.py                  trusted grader command or explicit offline diagnostic
+  grading.py                  trusted hidden-replay grader command
   admission.py, tasks.py      verify inputs, discover tasks and split families
   train.py, probe.py          training and evaluation entry points
 .state/                        private attempts, worker logs and training output

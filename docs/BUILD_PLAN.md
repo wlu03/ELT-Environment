@@ -19,7 +19,7 @@ The verified canary can still drive loader and failure-path integration tests.
 
 | Area | Reuse from Taskgen | Build in this project | State |
 | --- | --- | --- | --- |
-| Combined task/release contract | schema-3 manifest and package loader | supported-version/admission policy | partial; canary only |
+| Combined task contract | public/private bundles and TaskIR | metadata discovery and installed-input validation | implemented; hidden assets validated by configured grader |
 | Corpus | generation, gates, populations, attacks | immutable catalog and family splits | blocked on releases |
 | Public observation | public release files | versioned renderer, leak scan, token preflight | missing |
 | L1 action | workspace artifact mapping | `artifact-blocks-v1` reply parser | built |
@@ -45,16 +45,15 @@ Deliverables:
 - create a reviewed initial commit for `ELT-taskgen`;
 - build a wheel and record its source/wheel digest;
 - prove installed-package resource loading and run the targeted training tests;
-- freeze at least 2–4 real accepted combined tasks under the current release
-  schema, across more than one family;
-- record immutable train/validation/test family assignments in a manifest or
-  companion catalog;
+- freeze at least 2–4 real accepted combined task bundles across more than one
+  family;
+- record immutable train/validation/test family assignments with the run;
 - designate the synthetic canary as `harness_test`, never `train`.
 
 Exit tests:
 
-- release verification succeeds from a clean checkout;
-- `load_workspace_package` loads every admitted task;
+- task discovery and installed-input validation succeed from a clean checkout;
+- the configured grader validates every task's private replay assets;
 - known-correct artifacts label `1.0` and curated attacks receive their
   expected lower scores;
 - public task prose alone contains all semantics needed for the expected
@@ -75,7 +74,8 @@ src/elt_environment/
 
 Responsibilities:
 
-- read tasks/splits only from verified metadata;
+- discover parent tasks from public/private bundles and read family metadata
+  from private TaskIR;
 - preserve parent identity and family/cluster provenance;
 - allowlist public files and render them deterministically;
 - scan observations for private material and known leak canaries;
@@ -83,7 +83,7 @@ Responsibilities:
   model's exact tokenizer, renderer, stops, and limits;
 - quarantine tasks with stable reason codes before batching.
 
-Exit tests cover corrupted manifests, split overlap, symlinks, private path/key
+Exit tests cover malformed task metadata, split overlap, symlinks, private path/key
 leaks, credential-shaped values, deterministic rendering, and context overflow.
 
 ## Phase 2 — L1 artifact environment

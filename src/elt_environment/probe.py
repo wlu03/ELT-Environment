@@ -40,7 +40,6 @@ from elt_environment.train import (
     DEFAULT_RELEASES,
     PROJECT_ROOT,
     STATE_ROOT,
-    TASKGEN_ROOT,
     agent_config,
     check_run,
     default_renderer_name,
@@ -65,8 +64,6 @@ class ProbeConfig:
     bridge_bind_host: str = "127.0.0.1"
     bridge_container_host: str = "host.docker.internal"
     grader_command: str = ""
-    allow_declarative_grader: bool = False
-    taskgen_root: str = str(TASKGEN_ROOT)
     model_name: str = DEFAULT_MODEL
     model_path: str | None = None
     renderer_name: str | None = None
@@ -79,7 +76,6 @@ class ProbeConfig:
     eval_families: int = 5
     seed: int = 0
     grader_concurrency: int = 8
-    verify_releases: bool = True
     out_dir: str | None = None
 
 
@@ -115,7 +111,6 @@ async def probe(config: ProbeConfig) -> dict:
     renderer = cached_renderer(config.model_name, renderer_name)
     admitted, _ = admit_tasks(
         discover_tasks(Path(config.releases_root)),
-        verify=config.verify_releases,
         agent=agent_config(config),
     )
     train, _ = split_by_family([a.task for a in admitted], config.eval_families, config.seed)
@@ -124,9 +119,7 @@ async def probe(config: ProbeConfig) -> dict:
         config.out_dir or STATE_ROOT / "probes" / datetime.now().strftime("%Y%m%d-%H%M%S")
     )
     grader = GraderConfig(
-        taskgen_root=Path(config.taskgen_root),
         attempts_root=STATE_ROOT / "attempts",
-        verify_release=config.verify_releases,
         command=tuple(shlex.split(config.grader_command)),
     )
     service = tinker.ServiceClient()

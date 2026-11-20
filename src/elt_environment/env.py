@@ -321,7 +321,6 @@ class EltDatasetBuilder(RLDatasetBuilder):
     """Discover releases, admit tasks, split by family, and build train and eval datasets."""
 
     releases_root: str
-    taskgen_root: str
     attempts_root: str
     model_name: str
     renderer_name: str
@@ -334,7 +333,6 @@ class EltDatasetBuilder(RLDatasetBuilder):
     context_length: int = 65536
     grader_concurrency: int = 8
     grader_deadline_s: float | None = None
-    verify_releases: bool = True
     agent: AgentConfig = AgentConfig()
     grader_command: tuple[str, ...] = ()
 
@@ -343,7 +341,6 @@ class EltDatasetBuilder(RLDatasetBuilder):
         admitted, excluded = await asyncio.to_thread(
             admit_tasks,
             tasks,
-            verify=self.verify_releases,
             agent=self.agent,
         )
         for exclusion in excluded:
@@ -365,10 +362,8 @@ class EltDatasetBuilder(RLDatasetBuilder):
             ", ".join(task.task_id for task in evaluation),
         )
         grader = GraderConfig(
-            taskgen_root=Path(self.taskgen_root),
             attempts_root=Path(self.attempts_root),
             grader_deadline_s=self.grader_deadline_s,
-            verify_release=self.verify_releases,
             command=self.grader_command,
         )
 

@@ -131,7 +131,7 @@ def validate_input(config: AgentConfig, task):
     for path in source.rglob("*"):
         if path.is_symlink():
             raise ValueError("installed task inputs must not contain symlinks")
-        if path.name in {"private", "answer_key", "gold", "oracle", "release_manifest.json"}:
+        if path.name in {"private", "answer_key", "gold", "oracle", "task_ir.json"}:
             raise ValueError("inputs_root must contain only installed public development inputs")
     values = yaml.safe_load((source / "config.yaml").read_text())
     if task.destination not in values:

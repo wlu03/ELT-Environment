@@ -20,10 +20,9 @@ ELT-taskgen/runs/runtime_canary_20260901/snowflake/release/
   public/gate__five_backend_probe/
 ```
 
-`elt-taskgen verify` accepted all 101 pinned release files. Its manifest is
-schema 3.3 with `public_layout: combined`. It is a runtime canary, not an
-admitted training task: its solver prompt is empty, its transformation prose is
-stub-like, and it has no attack cases. Use it to test loading and interfaces,
+This historical fixture used the combined public/private layout. It is a
+runtime canary, not an admitted training task: its solver prompt is empty,
+its transformation prose is stub-like, and it has no attack cases. Use it to test loading and interfaces,
 not to train a policy.
 
 ### Generator-workspace anatomy
@@ -43,8 +42,6 @@ the environment must never hand this directory to a rollout.
 
 ```text
 release/
-├── release_manifest.json
-├── checksums.sha256
 ├── public/<task_id>/
 │   ├── config.yaml
 │   ├── data_model.yaml
@@ -57,7 +54,7 @@ release/
 │   └── elt/main.tf
 └── private/
     ├── <task_id>/
-    │   ├── semantic/task_ir.json
+    │   ├── task_ir.json                    # semantic/task_ir.json in older bundles
     │   ├── populations/
     │   │   ├── development/rendered/
     │   │   ├── primary/rendered/
@@ -193,24 +190,30 @@ The policy and Tinker telemetry must never receive:
 
 ## Admission rules for a training catalog
 
-A catalog entry is eligible only if all of these are true:
+A catalog is discovered from matching `public/<task_id>/` and
+`private/<task_id>/` directories, either in one bundle or one level beneath
+`releases_root`. Family comes from private TaskIR, destination from public
+`config.yaml`. Missing family, mismatched task IDs, ambiguous destinations,
+duplicate IDs and symlinked metadata are rejected. Only parent tasks become
+examples; public EL/T variants without their own private task are not added.
 
-1. It comes from `release_manifest.json`, not directory discovery.
-2. The release checksum/signature verification succeeds.
-3. The manifest declares the current supported schema-3 combined layout.
-4. The parent task is accepted for training; canaries and incomplete statuses
+The coordinator validates this metadata and the installed development inputs.
+The configured grader owns private asset validation and hidden replay. Corpus
+curation should additionally establish the following before training:
+
+1. The parent task is accepted for training; canaries and incomplete statuses
    are excluded unless an explicit harness-test catalog selects them.
-5. Public documentation fully states the task without relying on private
+2. Public documentation fully states the task without relying on private
    reference semantics.
-6. Prompt and a known-correct response fit the selected model renderer,
+3. Prompt and a known-correct response fit the selected model renderer,
    tokenizer, context window, and output limit.
-7. All required hidden populations and scorer assets load through
-   `load_workspace_package`.
-8. Train/eval membership is family- and cluster-disjoint and recorded in the
-   manifest or an immutable companion catalog.
-9. Known-correct and known-bad artifacts produce expected labels before the
+4. All required hidden populations and scorer assets load through the
+   configured grader, which reports invalid inputs as an unlabelled outcome.
+5. Train/eval membership is family- and cluster-disjoint and recorded with
+   the run. The coordinator currently splits by family.
+6. Known-correct and known-bad artifacts produce expected labels before the
    task enters a training batch.
-10. No public-file or rendered-observation leak scan fires.
+7. No public-file or rendered-observation leak scan fires.
 
 The environment should quarantine a task that fails admission. Context overflow,
 missing private evidence, and package incompatibility are harness/task defects,

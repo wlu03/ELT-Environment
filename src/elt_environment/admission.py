@@ -2,10 +2,8 @@
 
 from dataclasses import dataclass
 
-from elt_taskgen.training import load_workspace_package
-
 from elt_environment.runner import AgentConfig, validate_input
-from elt_environment.tasks import TaskRef
+from elt_environment.tasks import TaskRef, read_task
 
 
 @dataclass(frozen=True)
@@ -19,12 +17,13 @@ class Exclusion:
     reason: str
 
 
-def admit_tasks(tasks, *, verify=True, agent: AgentConfig):
-    """Admit packages; measure context on each actual request in EltEnv."""
+def admit_tasks(tasks, *, agent: AgentConfig):
+    """Validate task identity and installed inputs before sampling."""
     admitted, excluded = [], []
     for task in tasks:
         try:
-            load_workspace_package(task.release_dir, task.task_id, verify=verify)
+            if read_task(task.release_dir, task.task_id) != task:
+                raise ValueError("task metadata changed after discovery")
             validate_input(agent, task)
         except Exception as error:  # noqa: BLE001 -- package failures are admission exclusions
             excluded.append(Exclusion(task.task_id, f"input_invalid:{type(error).__name__}"))

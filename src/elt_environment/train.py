@@ -23,7 +23,6 @@ from elt_environment.runner import AgentConfig, preflight
 from elt_environment.tasks import discover_tasks
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-TASKGEN_ROOT = PROJECT_ROOT.parent / "ELT-taskgen"
 DEFAULT_RELEASES = PROJECT_ROOT / "training-data"
 STATE_ROOT = PROJECT_ROOT / ".state"
 DEFAULT_MODEL = "Qwen/Qwen3.8-27B"
@@ -46,8 +45,6 @@ class CLIConfig:
     bridge_bind_host: str = "127.0.0.1"
     bridge_container_host: str = "host.docker.internal"
     grader_command: str = ""
-    allow_declarative_grader: bool = False
-    taskgen_root: str = str(TASKGEN_ROOT)
     model_name: str = DEFAULT_MODEL
     renderer_name: str | None = None
     context_length: int = 65536
@@ -65,7 +62,6 @@ class CLIConfig:
     seed: int = 0
     grader_concurrency: int = 8
     max_group_attempts: int = 3
-    verify_releases: bool = True
     log_path: str | None = None
     wandb_project: str | None = None
     behavior_if_log_dir_exists: cli_utils.LogdirBehavior = "ask"
@@ -105,7 +101,6 @@ def build_config(cli: CLIConfig) -> Config:
     log_path = cli.log_path or str(STATE_ROOT / "runs" / run_name)
     dataset_builder = EltDatasetBuilder(
         releases_root=cli.releases_root,
-        taskgen_root=cli.taskgen_root,
         attempts_root=str(STATE_ROOT / "attempts"),
         model_name=cli.model_name,
         renderer_name=renderer_name,
@@ -117,7 +112,6 @@ def build_config(cli: CLIConfig) -> Config:
         max_tokens=cli.max_tokens,
         context_length=cli.context_length,
         grader_concurrency=cli.grader_concurrency,
-        verify_releases=cli.verify_releases,
         agent=agent_config(cli),
         grader_command=tuple(shlex.split(cli.grader_command)),
     )
@@ -170,11 +164,8 @@ def agent_config(cli) -> AgentConfig:
 
 def check_run(cli):
     """Reject unavailable runtimes and ambiguous grading before a paid API call."""
-    if not cli.grader_command and not cli.allow_declarative_grader:
-        raise ValueError(
-            "set grader_command to your trusted hidden-replay grader; "
-            "allow_declarative_grader=true selects the restricted offline scorer"
-        )
+    if not shlex.split(cli.grader_command):
+        raise ValueError("set grader_command to your trusted hidden-replay grader")
     tasks = discover_tasks(Path(cli.releases_root))
     if not tasks:
         raise ValueError("no task releases found")
