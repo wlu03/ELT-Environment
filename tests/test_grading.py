@@ -21,7 +21,7 @@ class CommandGraderTests(unittest.TestCase):
         write_bundle(self.root / "bundle")
         (self.task,) = discover_tasks(self.root / "bundle")
 
-    def grade(self, program, *, deadline=10):
+    def grade(self, program, *, deadline=10, runtime=None):
         script = self.root / "grader.py"
         script.write_text(program)
         config = GraderConfig(
@@ -29,7 +29,7 @@ class CommandGraderTests(unittest.TestCase):
             command=(sys.executable, str(script)),
             grader_deadline_s=deadline,
         )
-        outcome = grade_artifact(self.task, {"elt/main.tf": "terraform {}"}, config)
+        outcome = grade_artifact(self.task, {"elt/main.tf": "terraform {}"}, config, runtime)
         self.assertEqual(list(config.attempts_root.iterdir()), [])
         return outcome
 
@@ -46,6 +46,15 @@ assert sorted(os.listdir(payload['release_dir'])) == ['private', 'public']
 print(json.dumps({'label_valid': True, 'reward': .75, 'metrics': {'r_t': .5}}))
 """)
         self.assertEqual(outcome, ValidReward(0.75, {"r_t": 0.5}))
+
+    def test_command_gets_duckdb_receipt_only_when_supplied(self):
+        outcome = self.grade("""import json, sys
+with open(sys.argv[1]) as request:
+    payload = json.load(request)
+assert payload['runtime'] == {'storage': '/tmp/db', 'connection_ids': ['connection']}
+print(json.dumps({'label_valid': True, 'reward': 0.0}))
+""", runtime={"storage": "/tmp/db", "connection_ids": ["connection"]})
+        self.assertEqual(outcome, ValidReward(0.0, {}))
 
     def test_faults_are_discarded_and_private_requests_are_cleaned(self):
         for program, code in (

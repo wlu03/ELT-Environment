@@ -41,6 +41,7 @@ class CLIConfig:
     max_turns: int = 100
     agent_timeout_s: float = 7200
     agent_image: str | None = None
+    duckdb_local_root: str | None = None
     agent_network: str = "elt-docker_elt_network"
     bridge_bind_host: str = "127.0.0.1"
     bridge_container_host: str = "host.docker.internal"
@@ -156,6 +157,8 @@ def agent_config(cli) -> AgentConfig:
         context_length=cli.context_length,
         timeout_s=cli.agent_timeout_s,
         image=cli.agent_image,
+        duckdb_local_root=cli.duckdb_local_root,
+        duckdb_control_port=getattr(cli, "duckdb_control_port", None),
         network=cli.agent_network,
         bridge_bind_host=cli.bridge_bind_host,
         bridge_container_host=cli.bridge_container_host,

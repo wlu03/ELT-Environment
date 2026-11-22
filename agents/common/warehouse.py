@@ -82,6 +82,8 @@ def resolve_benchmark_path(destination: str, path: str | Path | None = None) -> 
 
 def adapt_prompt(text: str, destination: str) -> str:
     """Adapt a Snowflake/Databricks/Redshift benchmark prompt."""
+    if destination == "duckdb":
+        return re.sub(r"\b(?:Snowflake|Databricks|Redshift)\b", "DuckDB", text)
     spec = get_destination(destination)
     text = re.sub(r"\b(?:Snowflake|Databricks|Redshift)\b", spec.display_name, text)
 

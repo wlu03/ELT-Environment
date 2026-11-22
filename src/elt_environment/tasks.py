@@ -9,8 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
-from elt_taskgen.destinations import destination_from_config
+from elt_taskgen.destinations import Destination, destination_from_config
 from elt_taskgen.models import validate_task_id_segment
+
+from elt_environment.duckdb_target import duckdb_config
 
 
 @dataclass(frozen=True)
@@ -57,7 +59,13 @@ def read_task(release_dir: Path, task_id: str) -> TaskRef:
     destination_config = yaml.safe_load(config.read_text(encoding="utf-8"))
     if not isinstance(destination_config, dict):
         raise TypeError(f"{config}: expected a destination configuration object")
-    destination = destination_from_config(destination_config).value
+    if "duckdb" in destination_config:
+        if any(item.value in destination_config for item in Destination):
+            raise ValueError(f"{config}: choose a single destination")
+        duckdb_config(destination_config)
+        destination = "duckdb"
+    else:
+        destination = destination_from_config(destination_config).value
     return TaskRef(release_dir, task_id, family, destination)
 
 

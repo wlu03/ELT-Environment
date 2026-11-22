@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import stat
@@ -22,6 +23,7 @@ from pathlib import Path
 import yaml
 
 from elt_environment.bridge import Bridge
+from elt_environment.duckdb_target import stage_duckdb_input, validate_duckdb_workspace
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AGENTS = ("spider", "swe", "openhands", "codex", "claude")
@@ -50,6 +52,8 @@ class AgentConfig:
     attempts_root: str = str(PROJECT_ROOT / ".state/agent-attempts")
     network: str = "elt-docker_elt_network"
     image: str | None = None
+    duckdb_local_root: str | None = None
+    duckdb_control_port: int | None = None
     max_turns: int = 100
     max_tokens: int = 10240
     context_length: int = 65536
@@ -104,12 +108,14 @@ def preflight(config: AgentConfig, tasks=(), *, docker: bool = True):
             f"{config.agent} dependencies are missing from {config.python}; "
             "install that agent's requirements in its worker environment"
         )
+    images = set()
     for task in tasks:
         validate_input(config, task)
+        images.add(agent_image(config, task.destination))
     if docker:
         for args in (
             ["info"],
-            ["image", "inspect", config.image or IMAGES[config.agent]],
+            *(["image", "inspect", image] for image in sorted(images or {agent_image(config)})),
             ["network", "inspect", config.network],
         ):
             result = subprocess.run(["docker", *args], capture_output=True, timeout=30, check=False)
@@ -117,11 +123,28 @@ def preflight(config: AgentConfig, tasks=(), *, docker: bool = True):
                 raise ValueError(f"Docker preflight failed: docker {' '.join(args)}")
 
 
+def agent_image(config: AgentConfig, destination: str | None = None) -> str:
+    return config.image or ("elt-swe-duckdb" if destination == "duckdb" else IMAGES[config.agent])
+
+
+def duckdb_storage_root(config: AgentConfig) -> Path:
+    if not config.duckdb_local_root:
+        raise ValueError("set duckdb_local_root to the host directory mounted as /local by Airbyte")
+    root = Path(config.duckdb_local_root).resolve(strict=True)
+    if not root.is_dir() or ":" in str(root):
+        raise ValueError("duckdb_local_root must be a Docker-mountable directory")
+    return root
+
+
 def validate_input(config: AgentConfig, task):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", task.task_id):
         raise ValueError("task id must be a single safe path component")
     if config.agent == "spider" and task.destination != "snowflake":
         raise ValueError("the original Spider tools support Snowflake only")
+    if task.destination == "duckdb":
+        if config.agent != "swe":
+            raise ValueError("DuckDB development is supported with agent=swe")
+        duckdb_storage_root(config)
     source = Path(config.inputs_root).resolve() / task.task_id
     if source.is_symlink() or not source.is_dir():
         raise ValueError(f"installed input missing: {task.task_id}")
@@ -133,6 +156,8 @@ def validate_input(config: AgentConfig, task):
     values = yaml.safe_load((source / "config.yaml").read_text())
     if task.destination not in values:
         raise ValueError(f"installed input destination mismatch: {task.task_id}")
+    if task.destination == "duckdb":
+        validate_duckdb_workspace(values)
     serialized = json.dumps(values)
     if "<" in serialized and ">" in serialized:
         raise ValueError(f"install runtime credentials before running {task.task_id}")
@@ -222,6 +247,7 @@ class AgentSession:
         self.log = None
         self.root = None
         self.container_name = None
+        self.duckdb_storage = None
         self.started = 0.0
         self.stopped = False
 
@@ -241,7 +267,18 @@ class AgentSession:
         self.started = time.monotonic()
         self.root = Path(tempfile.mkdtemp(prefix="agent-", dir=attempts))
         self.workspace = self.root / "workspace"
-        self.snapshot = public_snapshot(Path(self.config.inputs_root) / self.task.task_id)
+        inputs = Path(self.config.inputs_root).resolve()
+        if self.task.destination == "duckdb":
+            self.duckdb_storage = Path(
+                tempfile.mkdtemp(prefix="elt-duckdb-", dir=duckdb_storage_root(self.config))
+            )
+            self.duckdb_storage.chmod(0o733)
+            staged = self.root / "inputs"
+            stage_duckdb_input(
+                inputs / self.task.task_id, staged / self.task.task_id, self.duckdb_storage
+            )
+            inputs = staged
+        self.snapshot = public_snapshot(inputs / self.task.task_id)
         await self.bridge.start()
         attempt_id = "tinker-" + uuid.uuid4().hex[:16]
         self.container_name = attempt_id + "-" + self.task.task_id
@@ -261,8 +298,9 @@ class AgentSession:
             "host_url": f"http://127.0.0.1:{self.bridge.port}/v1",
             "container_url": f"http://{self.config.bridge_container_host}:{self.bridge.port}/v1",
             "token": self.bridge.token,
-            "image": self.config.image or IMAGES[self.config.agent],
-            "inputs_root": str(Path(self.config.inputs_root).resolve()),
+            "image": agent_image(self.config, self.task.destination),
+            "inputs_root": str(inputs),
+            "duckdb_storage": str(self.duckdb_storage) if self.duckdb_storage else None,
             "agents_root": str(Path(self.config.agents_root).resolve()),
         }
         spec_file = self.root / "worker.json"
@@ -310,6 +348,23 @@ class AgentSession:
         if public_snapshot(self.workspace) != self.snapshot:
             raise SubmissionViolation("public input changed")
         return collect_artifact(self.workspace)
+
+    def duckdb_replay_receipt(self) -> dict:
+        from elt_taskgen.runtime.process_compliance import (
+            ProcessComplianceError,
+            find_terraform_state,
+            terraform_state_connections,
+        )
+
+        state = find_terraform_state(self.workspace / "elt")
+        try:
+            ids = (
+                sorted(terraform_state_connections(state))
+                if state and state.stat().st_size <= 4 * 1024 * 1024 else []
+            )
+        except ProcessComplianceError:
+            ids = []
+        return {"connection_ids": ids, "storage": str(self.duckdb_storage)}
 
     async def stop_worker(self):
         if self.stopped:
@@ -365,11 +420,16 @@ class AgentSession:
             finally:
                 await self.bridge.close()
         finally:
-            if self.log:
-                self.log.close()
-                self.log = None
-            if self.root:
-                (self.root / "worker.json").unlink(missing_ok=True)
-            if self.lock:
-                self.lock.close()
-                self.lock = None
+            try:
+                if self.log:
+                    self.log.close()
+                    self.log = None
+                if self.root:
+                    (self.root / "worker.json").unlink(missing_ok=True)
+                if self.duckdb_storage and self.stopped:
+                    shutil.rmtree(self.duckdb_storage)
+                    self.duckdb_storage = None
+            finally:
+                if self.lock:
+                    self.lock.close()
+                    self.lock = None

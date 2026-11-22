@@ -37,7 +37,9 @@ def _reason_code(code: str) -> str:
     return code if _REASON_CODE.fullmatch(code) else "harness_fault"
 
 
-def grade_artifact(task: TaskRef, files: Mapping[str, str], config: GraderConfig) -> GraderOutcome:
+def grade_artifact(
+    task: TaskRef, files: Mapping[str, str], config: GraderConfig, runtime: dict | None = None
+) -> GraderOutcome:
     """Invoke an operator-configured hidden-replay grader outside the agent.
 
     The command gets one JSON request path and writes an outcome JSON object
@@ -58,6 +60,7 @@ def grade_artifact(task: TaskRef, files: Mapping[str, str], config: GraderConfig
                         "release_dir": str(task.release_dir.resolve()),
                         "destination": task.destination,
                         "files": dict(files),
+                        **({"runtime": runtime} if runtime is not None else {}),
                     }
                 )
             )

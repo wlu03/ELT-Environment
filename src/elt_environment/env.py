@@ -55,7 +55,8 @@ def _grader_pool(workers: int) -> ThreadPoolExecutor:
 
 
 async def run_grader(
-    task: TaskRef, files: Mapping[str, str], grader: GraderConfig, workers: int
+    task: TaskRef, files: Mapping[str, str], grader: GraderConfig, workers: int,
+    runtime: dict | None = None,
 ) -> GraderOutcome:
     """Grade on a shared pool of ``workers`` threads and return the outcome.
 
@@ -65,7 +66,8 @@ async def run_grader(
     """
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_grader_pool(workers), grade_artifact, task, files, grader)
+    args = (task, files, grader) if runtime is None else (task, files, grader, runtime)
+    return await loop.run_in_executor(_grader_pool(workers), grade_artifact, *args)
 
 
 class EltEnv(Env):
@@ -150,9 +152,10 @@ class EltEnv(Env):
                 files = self.session.artifact()
             except SubmissionViolation:
                 return self._final(0.0, {"policy_violation": 1.0, "model_calls": float(self.turns)})
-            grading = asyncio.create_task(
-                run_grader(self.task, files, self.grader, self.grader_concurrency)
-            )
+            grader_args = (self.task, files, self.grader, self.grader_concurrency)
+            if self.task.destination == "duckdb":
+                grader_args += (self.session.duckdb_replay_receipt(),)
+            grading = asyncio.create_task(run_grader(*grader_args))
             try:
                 outcome = await asyncio.shield(grading)
             except asyncio.CancelledError:
