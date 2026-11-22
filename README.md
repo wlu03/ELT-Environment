@@ -80,8 +80,11 @@ duckdb:
     schema: main
 ```
 
-Use the DuckDB connector definition ID in your Airbyte workspace. Keep the
-Airbyte workspace and source settings in the installed development config.
+Use the DuckDB connector definition ID in your Airbyte workspace. For sources
+that emit global checkpoints, including MongoDB, build and register the
+patched connector at `runtime/airbyte-duckdb/Dockerfile`. Use that custom
+definition ID in both the public and installed configs. Keep the Airbyte
+workspace and source settings in the installed development config.
 Install the scoped workspace credentials and seed development data before
 running a probe. The public bundle contains task inputs and templates.
 

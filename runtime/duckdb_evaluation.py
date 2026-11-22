@@ -16,7 +16,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from threading import Thread
+from threading import Lock, Thread
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import yaml
@@ -47,6 +48,7 @@ IMAGE = "elt-swe-duckdb"
 LOCAL_ROOT = Path.home() / ".airbyte/abctl/data/elt-environment-duckdb"
 WORKER = ENVIRONMENT.parent / "elt_agent_eval_run/agentvenv/bin/python"
 COORDINATOR = ENVIRONMENT / ".venv/bin/python"
+CONNECTOR = "local/elt-destination-duckdb"
 
 
 class DuckDBGateway(GatewayBridge):
@@ -56,6 +58,7 @@ class DuckDBGateway(GatewayBridge):
         super().__init__(scoped, shared, workspace, definitions, "", "", hosts)
         self.schema = schema
         self.previous_paths = set(LOCAL_ROOT.iterdir())
+        self.sync_lock = Lock()
 
     def forward(self, method, path, headers, body):
         if method == "POST" and path == PREFIX + "destinations":
@@ -81,6 +84,9 @@ class DuckDBGateway(GatewayBridge):
                     403, "Forbidden", (("Content-Type", "application/json"),),
                     json.dumps({"message": message}).encode(),
                 )
+        if method == "POST" and urlsplit(path).path == PREFIX + "jobs":
+            with self.sync_lock:
+                return super().forward(method, path, headers, body)
         return super().forward(method, path, headers, body)
 
     def _in_destination_scope(self, payload):
@@ -105,6 +111,16 @@ class DuckDBGateway(GatewayBridge):
                 and config.get("schema", "main") == self.schema and len(active) == 1
                 and config.get("destination_path") == f"/local/{active[0].name}/warehouse.duckdb"
             )
+        if method == "POST" and parts == ["jobs"] and self.job_connections:
+            headers = {"Authorization": self.shared}
+            last = next(reversed(self.job_connections))
+            response = self._send("GET", f"{PREFIX}jobs/{last}", headers, b"", None)
+            if response.status != 200:
+                return False
+            job = json.loads(response.body)
+            status = job.get("data", job.get("job", job)).get("status")
+            if status not in {"succeeded", "failed", "cancelled", "canceled", "incomplete"}:
+                return False
         return super()._allowed(method, parts, query, body)
 
 
@@ -196,7 +212,14 @@ def run_attempt(args, record, label, api, credentials_file, airbyte_url):
         try:
             config = yaml.safe_load((original / "public" / task / "config.yaml").read_text())
             _, definitions = prepare_airbyte(public, answer, task, api, workspace, config)
-            definition = config["duckdb"]["config"]["definition_id"]
+            definition = api.request("POST", "../../v1/destination_definitions/create_custom", {
+                "workspaceId": workspace,
+                "destinationDefinition": {
+                    "name": "ELT DuckDB with protocol aliases", "dockerRepository": CONNECTOR,
+                    "dockerImageTag": "0.6.0-state-alias",
+                    "documentationUrl": "https://docs.airbyte.com/integrations/destinations/duckdb",
+                },
+            })["destinationDefinitionId"]
             definitions["destinations"] = {definition}
             config["duckdb"]["config"]["definition_id"] = definition
             airbyte = config["Airbyte"]["config"]
