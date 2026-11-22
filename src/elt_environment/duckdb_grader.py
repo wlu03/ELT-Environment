@@ -29,6 +29,24 @@ from elt_environment.tasks import read_task
 HIDDEN = ("primary", "resampled", "counterfactual", "stress")
 DBT_IMAGE = "elt-swe-duckdb"
 TERMINAL_JOBS = {"succeeded", "failed", "cancelled", "canceled", "incomplete"}
+DBT_RUNTIME_ERROR = re.compile(
+    r"could not set lock on file|conflicting lock is held|no space left on device|"
+    r"failed to create (?:a )?thread|can't start new thread|"
+    r"(?:io error|permission denied).*?(?:/duckdb/warehouse\.duckdb|/tmp/(?:target|logs))",
+    re.IGNORECASE,
+)
+DBT_PROJECT_ERROR = re.compile(
+    r"^(?:Compilation|Parsing|Dependency) Error\b|^Runtime Error\s+"
+    r"(?:Could not find profile named|Syntax error near line)\b|"
+    r"^Error encountered in /submission/.+/dbt_project\.yml$",
+    re.MULTILINE,
+)
+DBT_LOG_TAIL = 12000
+
+
+class DbtReplayError(RuntimeError):
+    """Hidden dbt execution could not produce a reliable grading result."""
+
 READ_WAREHOUSE = """
 import json
 import sys
@@ -118,15 +136,67 @@ def stage_submission(files: dict[str, str], root: Path) -> Path | None:
     return projects[0].parent
 
 
+def dbt_replay_status(result: subprocess.CompletedProcess) -> str:
+    errors = []
+    for line in result.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or not isinstance(info := event.get("info"), dict):
+            continue
+        if info.get("level") in ("error", "fatal"):
+            data = event.get("data")
+            errors.append((info.get("name"), data if isinstance(data, dict) else {}, info.get("msg", "")))
+    if any(
+        DBT_RUNTIME_ERROR.search(str(data.get("exc") or data.get("msg") or message))
+        for _, data, message in errors
+    ):
+        return "grader_error"
+    if result.returncode == 0:
+        return "success"
+    startup_errors = [data.get("exc", "") for name, data, _ in errors if name == "MainEncounteredError"]
+    if startup_errors:
+        if result.returncode in (1, 2) and all(DBT_PROJECT_ERROR.search(str(error)) for error in startup_errors):
+            return "project_error"
+        return "grader_error"
+    if result.returncode == 1 and any(name == "RunResultError" for name, _, _ in errors):
+        return "model_error"
+    return "grader_error"
+
+
+def log_dbt(population: str, status: str, **details) -> None:
+    print(json.dumps({"phase": "hidden_dbt", "population": population, "status": status, **details}),
+          file=sys.stderr)
+
+
+def log_tail(output: str | bytes | None) -> str:
+    if isinstance(output, bytes):
+        output = output.decode(errors="replace")
+    return (output or "")[-DBT_LOG_TAIL:]
+
+
 def run_dbt(storage: Path, root: Path, project: Path, population: str) -> None:
-    result = sandbox(
-        storage, "dbt", "run", "--project-dir",
-        f"/submission/{project.relative_to(root).as_posix()}",
-        "--profiles-dir", "/submission", "--target-path", "/tmp/target",
-        "--log-path", "/tmp/logs", project=root,
-    )
-    if result.returncode not in (0, 1, 2):
-        result.check_returncode()
+    try:
+        result = sandbox(
+            storage, "dbt", "--no-use-colors", "--log-format", "json", "run",
+            "--project-dir", f"/submission/{project.relative_to(root).as_posix()}",
+            "--profiles-dir", "/submission", "--target-path", "/tmp/target",
+            "--log-path", "/tmp/logs", project=root,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        log_dbt(
+            population, "grader_error", error=type(error).__name__,
+            returncode=getattr(error, "returncode", None),
+            stdout=log_tail(getattr(error, "stdout", None)),
+            stderr=log_tail(getattr(error, "stderr", None)),
+        )
+        raise DbtReplayError from error
+    status = dbt_replay_status(result)
+    log_dbt(population, status, returncode=result.returncode,
+            stdout=log_tail(result.stdout), stderr=log_tail(result.stderr))
+    if status == "grader_error":
+        raise DbtReplayError
 
 
 def settle_jobs(client: AirbyteClient, connections: list[str]) -> None:
@@ -354,8 +424,12 @@ def replay(request: dict, runtime: dict, client: AirbyteClient, temp: Path) -> d
                         )
                     }
                     passed.append(matches)
+                    log_dbt(population, "compared", readable_marts=sorted(observed),
+                            matching_marts=sorted(matches))
                 else:
                     passed.append(set())
+                    if el:
+                        log_dbt(population, "missing_unique_project")
             finally:
                 hidden.stop()
     mart_count = len(ir.marts)
@@ -386,6 +460,8 @@ def main() -> None:
         )
         with tempfile.TemporaryDirectory(prefix="duckdb-replay-", dir=args.request.parent) as temp:
             result = replay(request, runtime, client, Path(temp))
+    except DbtReplayError:
+        result = {"label_valid": False, "reason_code": "duckdb_dbt_replay_failed"}
     except Exception as error:
         print(f"DuckDB replay failed: {type(error).__name__}", file=sys.stderr)
         result = {"label_valid": False, "reason_code": "duckdb_replay_failed"}
