@@ -54,6 +54,11 @@ and Redshift destinations. See each folder's requirements and Docker build files
 - `max_steps` bounds training updates. 
 - `max_tokens` applies to each sampled reply.
 
+Training shows an overall progress bar with completed steps, elapsed time and
+estimated time remaining, alongside the per-batch sampling bar. It respects
+`max_steps` and resumes from the checkpoint's completed step count. Add
+`progress_bar=false` to disable the overall bar.
+
 Family holdouts remain separate from training. Probes save every sampled turn,
 its token IDs, log probabilities and terminal reward.
 
