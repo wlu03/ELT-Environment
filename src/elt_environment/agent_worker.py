@@ -182,21 +182,22 @@ def start_private_swe(spec: dict, docker_args: list[str]) -> dict:
     host, port = "http://127.0.0.1", spec["duckdb_control_port"]
     request = urllib.request.Request(f"{host}:{port}/is_alive", headers={"X-API-Key": token})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    result = subprocess.run(command, capture_output=True, timeout=45)
-    if result.returncode:
-        raise RuntimeError(f"could not start private SWE-ReX (Docker exit {result.returncode})")
-    deadline = time.monotonic() + 45
-    while time.monotonic() < deadline:
-        try:
-            with opener.open(request, timeout=2) as response:
-                if response.status == 200:
-                    return {"type": "remote", "host": host, "port": port, "auth_token": token,
-                            "timeout": 30}
-        except OSError:
-            pass
-        time.sleep(0.5)
-    subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=20)
-    raise RuntimeError("private SWE-ReX did not become ready")
+    for _ in range(2):
+        result = subprocess.run(command, capture_output=True, timeout=45)
+        if result.returncode:
+            raise RuntimeError(f"could not start private SWE-ReX (Docker exit {result.returncode})")
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            try:
+                with opener.open(request, timeout=2) as response:
+                    if response.status == 200:
+                        return {"type": "remote", "host": host, "port": port, "auth_token": token,
+                                "timeout": 30}
+            except OSError:
+                pass
+            time.sleep(0.5)
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=20)
+    raise RuntimeError("private SWE-ReX did not become ready after two starts")
 
 
 async def run_sdk(spec: dict, root: Path):

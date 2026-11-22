@@ -3,8 +3,9 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
+from elt_environment.agent_worker import start_private_swe
 from elt_environment.env import EltEnv
 from elt_environment.outcomes import ValidReward
 from elt_environment.runner import AgentConfig
@@ -56,3 +57,29 @@ class OutputTruncationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.metrics["format_error"], 1.0)
         self.assertFalse(result.metrics.get("output_truncated"))
         grader.assert_not_awaited()
+
+
+class SolverStartupTests(unittest.TestCase):
+    def test_timed_out_solver_is_removed_before_retry(self):
+        opener = Mock()
+        response = MagicMock()
+        response.__enter__.return_value.status = 200
+        opener.open.side_effect = [ConnectionError(), response]
+        with (
+            patch("elt_environment.agent_worker.urllib.request.build_opener", return_value=opener),
+            patch("elt_environment.agent_worker.time.monotonic", side_effect=[0, 0, 46, 46, 46]),
+            patch("elt_environment.agent_worker.time.sleep"),
+            patch("elt_environment.agent_worker.subprocess.run") as run,
+        ):
+            run.return_value.returncode = 0
+            result = start_private_swe({
+                "container_name": "test-solver", "image": "test-image",
+                "duckdb_control_port": 3333,
+            }, [])
+
+        self.assertEqual(result["port"], 3333)
+        self.assertEqual(
+            [call.args[0][:4] for call in run.call_args_list],
+            [["docker", "run", "--rm", "--detach"], ["docker", "rm", "-f", "test-solver"],
+             ["docker", "run", "--rm", "--detach"]],
+        )
