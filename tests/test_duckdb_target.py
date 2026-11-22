@@ -1,6 +1,7 @@
 import json
 import os
 import stat
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,7 +13,8 @@ from task_fixtures import write_bundle
 from elt_environment.duckdb_grader import stage_submission
 from elt_environment.duckdb_target import stage_duckdb_input
 from elt_environment.runner import (
-    AgentConfig, AgentSession, agent_image, public_snapshot, validate_input,
+    AgentConfig, AgentSession, SubmissionViolation, agent_image, public_snapshot,
+    submission_artifact, validate_input,
 )
 from elt_environment.tasks import discover_tasks
 
@@ -94,6 +96,63 @@ class DuckDBTargetTests(unittest.TestCase):
             for path in ("elt/../outside.sql", "elt/profiles.yml", "other/dbt_project.yml"):
                 with self.subTest(path=path), self.assertRaisesRegex(ValueError, "submission path"):
                     stage_submission({path: ""}, root)
+
+    def test_real_swe_submit_does_not_invalidate_duckdb_pipeline(self):
+        submit = Path(__file__).resolve().parents[1] / "agents/SWE-agent/tools/submit/bin/submit"
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "config.yaml").write_text("public: true\n")
+            (root / "elt").mkdir()
+            baseline = public_snapshot(root)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            (root / "elt/main.tf").write_text("terraform {}\n")
+            (root / ".user.yml").write_text("id: example\n")
+            (root / "logs").mkdir()
+            (root / "logs/dbt.log").write_text("dbt run\n")
+            subprocess.run(["bash", str(submit)], cwd=root, check=True, capture_output=True,
+                           env={**os.environ, "ROOT": str(root)})
+            self.assertTrue((root / "model.patch").is_file())
+            self.assertEqual(submission_artifact(root, baseline, swe=True, duckdb=True), {
+                "elt/main.tf": "terraform {}\n",
+            })
+            unexpected = root / "logs/unexpected.sql"
+            unexpected.write_text("select 1\n")
+            with self.assertRaisesRegex(SubmissionViolation, "public input changed"):
+                submission_artifact(root, baseline, swe=True, duckdb=True)
+            unexpected.unlink()
+            (root / "config.yaml").write_text("public: false\n")
+            with self.assertRaisesRegex(SubmissionViolation, "public input changed"):
+                submission_artifact(root, baseline, swe=True, duckdb=True)
+
+    def test_sibling_dbt_project_is_staged_under_elt(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch) / "workspace"
+            root.mkdir()
+            (root / "profiles.yml").write_text("provided\n")
+            baseline = public_snapshot(root)
+            project = root / "my_models"
+            project.mkdir()
+            (project / "dbt_project.yml").write_text("profile: elt_environment\n")
+            (project / "model.sql").write_text("select 1\n")
+            (project / "do_not_collect.tf").write_text("terraform {}\n")
+            (root / "stg_customer.sql").write_text("select 42\n")
+            artifact = submission_artifact(root, baseline, swe=True, duckdb=True)
+            self.assertEqual(set(artifact), {"elt/my_models/dbt_project.yml", "elt/my_models/model.sql"})
+            staging = root.parent / "hidden"
+            self.assertEqual(stage_submission(artifact, staging), staging / "elt/my_models")
+            (project / "private.sql").symlink_to(root / "profiles.yml")
+            with self.assertRaisesRegex(SubmissionViolation, "public symlink"):
+                submission_artifact(root, baseline, swe=True, duckdb=True)
+
+    def test_provided_root_sql_stays_protected(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            public_sql = root / "source.sql"
+            public_sql.write_text("select 1\n")
+            baseline = public_snapshot(root)
+            public_sql.write_text("select 2\n")
+            with self.assertRaisesRegex(SubmissionViolation, "public input changed"):
+                submission_artifact(root, baseline, swe=True, duckdb=True)
 
 class DuckDBSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_duckdb_session_passes_attempt_storage_to_worker_and_cleans_it(self):
