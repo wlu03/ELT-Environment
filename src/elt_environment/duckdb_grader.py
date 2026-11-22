@@ -6,6 +6,7 @@ import argparse
 from collections.abc import Mapping
 import json
 from pathlib import Path, PurePosixPath
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,8 +17,9 @@ import yaml
 from elt_taskgen.models import task_from_json
 from elt_taskgen.runtime import source_server
 from elt_taskgen.runtime.airbyte import (
-    AirbyteClient, AirbyteSyncFailure, access_token_provider,
+    AirbyteClient, AirbyteError, AirbyteSyncFailure, access_token_provider,
 )
+from elt_taskgen.runtime.process_compliance import workspace_connection_streams
 from elt_taskgen.runtime.source_environment import SourceEnvironment, _compose_document, _safe_project
 from elt_taskgen.verification.upstream_eval import compare_mart
 
@@ -152,6 +154,87 @@ def reward(el: bool, marts: float) -> dict:
     }
 
 
+def missing_required_streams(required: set[str], connections: list[dict]) -> set[str] | None:
+    """Return missing raw tables when Airbyte exposes every connection's stream selection."""
+    for connection in connections:
+        config = connection.get("configurations")
+        streams = config.get("streams") if isinstance(config, Mapping) else None
+        if not isinstance(streams, list) or any(
+            not isinstance(stream, Mapping) or not isinstance(stream.get("name"), str)
+            or not stream["name"] for stream in streams
+        ):
+            return None
+    selected = {
+        stream.casefold()
+        for names in workspace_connection_streams(connections).values()
+        for stream in names
+    }
+    return {table for table in required if table.casefold() not in selected}
+
+
+def invalid_s3_stream(
+    client: AirbyteClient, error: AirbyteSyncFailure, hidden: SourceEnvironment,
+) -> bool:
+    """Prove the submitted S3 connection requests an absent literal object."""
+    try:
+        job = client.request("POST", "../../v1/jobs/get", {"id": error.job_id})
+        failures = [
+            failure for record in job.get("attempts", [])
+            for failure in (record.get("attempt", record).get("failureSummary") or {}).get("failures", [])
+        ]
+        if not any(
+            failure.get("failureOrigin") == "source"
+            and failure.get("failureType") == "config_error"
+            and "No files were identified in the stream" in (failure.get("internalMessage") or "")
+            for failure in failures
+        ):
+            return False
+        connection = client.request("GET", f"connections/{error.connection_id}")
+        source = client.request("GET", f"sources/{connection['sourceId']}")
+        settings = source["configuration"]
+        bucket = settings.get("bucket")
+        if not bucket:
+            return False
+        manifest = json.loads(hidden.manifest_path.read_text())["tables"]
+        native = [(name, entry) for name, entry in manifest.items()
+                  if entry.get("backend") == "s3" and entry.get("bucket") == bucket]
+        if not native:
+            return False
+        objects = set()
+        for name, entry in native:
+            directory = hidden._artifact_dir(entry, "rendered_dir", name)
+            pattern = entry.get("rendered_parts_glob") or entry.get("parts_glob") or "part-*.jsonl"
+            parts = list(directory.glob(pattern))
+            if not parts:
+                return False
+            if entry.get("object_key"):
+                objects.add(entry["object_key"].strip("/"))
+            else:
+                prefix = (entry.get("key_prefix") or name).strip("/")
+                objects.update(f"{prefix}/{part.name}" for part in parts)
+        for name, entry in manifest.items():
+            if entry.get("backend") == "files":
+                objects.add(hidden._artifact_file(entry, "rendered_file", name).name)
+
+        selected = (connection.get("configurations") or {}).get("streams")
+        if not isinstance(selected, list):
+            return False
+        stream_names = {stream["name"] for stream in selected}
+        for stream in settings.get("streams", []):
+            patterns = stream.get("globs")
+            if stream.get("name") not in stream_names or not isinstance(patterns, list):
+                continue
+            if patterns and all(
+                isinstance(pattern, str) and pattern and not set(pattern) & set("*?[]{}!\\")
+                and pattern == pattern.strip("/")
+                and pattern not in objects for pattern in patterns
+            ):
+                return True
+    except (AirbyteError, KeyError, TypeError, AttributeError, ValueError, OSError):
+        pass
+    return False
+
+
 def replay(request: dict, runtime: dict, client: AirbyteClient, temp: Path) -> dict:
     release = Path(runtime["release_dir"]).resolve(strict=True)
     if release != Path(request["release_dir"]).resolve() or runtime["task_id"] != request["task_id"]:
@@ -208,6 +291,17 @@ def replay(request: dict, runtime: dict, client: AirbyteClient, temp: Path) -> d
         ):
             raise ValueError("registered destination is outside the attempt DuckDB path")
 
+    required = {table.name for table in ir.tables}
+    missing = missing_required_streams(required, [registered[key] for key in connections])
+    if missing is None:
+        missing = missing_required_streams(required, [
+            client.request("GET", f"connections/{key}") for key in connections
+        ])
+    if missing:
+        result = reward(False, 0.0)
+        result["metrics"]["missing_stream_count"] = float(len(missing))
+        return result
+
     project_root = temp / "submission"
     project = stage_submission(request["files"], project_root)
     settle_jobs(client, sorted(registered))
@@ -238,6 +332,10 @@ def replay(request: dict, runtime: dict, client: AirbyteClient, temp: Path) -> d
                     for connection in connections:
                         client.trigger_and_wait_receipt([connection], poll_interval=5, timeout=480)
                 except AirbyteSyncFailure as error:
+                    if invalid_s3_stream(client, error, hidden):
+                        result = reward(False, 0.0)
+                        result["metrics"]["s3_stream_configuration_error"] = 1.0
+                        return result
                     print(f"Airbyte replay failed on {population}, job {error.job_id}", file=sys.stderr)
                     return {"label_valid": False, "reason_code": "airbyte_replay_incomplete"}
                 el = (storage / "warehouse.duckdb").is_file() and (
