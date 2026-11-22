@@ -54,8 +54,6 @@ class AgentConfig:
     max_tokens: int = 10240
     context_length: int = 65536
     timeout_s: float = 7200
-    # Container calls must reach the host bridge. Linux hosts may supply a
-    # gateway IP; Docker Desktop resolves host.docker.internal automatically.
     bridge_bind_host: str = "127.0.0.1"
     bridge_container_host: str = "host.docker.internal"
 
@@ -73,7 +71,6 @@ class AgentConfig:
 
 
 def worker_environment() -> dict[str, str]:
-    # No inherited provider/cloud keys, user PYTHONPATH, or Tinker credentials.
     names = (
         "PATH",
         "LANG",
@@ -139,7 +136,6 @@ def validate_input(config: AgentConfig, task):
     serialized = json.dumps(values)
     if "<" in serialized and ">" in serialized:
         raise ValueError(f"install runtime credentials before running {task.task_id}")
-    # Schemas and the requested output must match the frozen grading task.
     for name in ("data_model.yaml", "schemas"):
         public = task.public_dir / name
         installed = source / name
@@ -234,8 +230,6 @@ class AgentSession:
         validate_input(self.config, self.task)
         attempts = Path(self.config.attempts_root).resolve()
         attempts.mkdir(parents=True, exist_ok=True, mode=0o700)
-        # Cross-process lock: upstream runners reset shared warehouse schemas.
-        # Hold it through grading and cleanup, not just during initialization.
         lock_path = Path(self.config.inputs_root).resolve() / ".tinker-runtime.lock"
         self.lock = lock_path.open("a")
         while True:
@@ -275,7 +269,6 @@ class AgentSession:
         spec_file.write_text(json.dumps(spec))
         spec_file.chmod(0o600)
         self.log = (self.root / "worker.log").open("wb")
-        # Run the standalone file so the worker does not need Tinker installed.
         self.process = await asyncio.create_subprocess_exec(
             self.config.python,
             str(Path(__file__).with_name("agent_worker.py")),
@@ -331,7 +324,6 @@ class AgentSession:
             except ProcessLookupError:
                 pass
         if self.container_name:
-            # The upstream finally block may not run after cancellation.
             process = await asyncio.create_subprocess_exec(
                 "docker",
                 "rm",
@@ -347,8 +339,6 @@ class AgentSession:
                 await process.wait()
                 raise AgentFault("container_cleanup_failed")
             if process.returncode != 0:
-                # A container already removed by the runner is fine; a still
-                # running one or an unreachable daemon must stop the run.
                 check = await asyncio.create_subprocess_exec(
                     "docker",
                     "ps",

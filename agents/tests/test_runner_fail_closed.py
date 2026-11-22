@@ -62,7 +62,6 @@ class PrepareDestinationWrapsFailuresTest(unittest.TestCase):
             self.assertIsInstance(ctx.exception.__cause__, RuntimeError)
             self.assertIn("boom", str(ctx.exception))
 
-            # Config-load failures take the same typed path.
             missing_config_dir = Path(tmp) / "empty_task"
             missing_config_dir.mkdir()
             with self.assertRaises(DestinationPreparationError) as ctx:
@@ -77,8 +76,6 @@ class RunnerAbortsBeforeSessionTest(unittest.TestCase):
         except ImportError:
             self.skipTest(f"{name} is not installed")
         if getattr(module, "__file__", None) is None:
-            # A bare namespace package (e.g. this repo's agents/ directory
-            # picked up from the working directory), not an installed SDK.
             self.skipTest(f"{name} resolves to a namespace package, not an SDK")
 
     def _assert_runner_fails_closed(self, runner_path: Path, module_name: str):
@@ -117,9 +114,7 @@ class RunnerAbortsBeforeSessionTest(unittest.TestCase):
                             max_turns=1,
                         )
                     )
-            # No seed copy and no container means no agent session started.
             self.assertEqual(calls, [])
-            # Nothing for evaluation to consume.
             self.assertFalse(result_path.exists())
 
     def test_codex_runner_aborts_before_session(self):

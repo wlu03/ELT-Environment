@@ -159,9 +159,6 @@ def _load_destination_config(
         if generated_credential.is_file():
             credentials = _read_json(generated_credential)
 
-    # A full Snowflake connection file can use an administrative role while
-    # config.yaml names the Airbyte destination role that should own the
-    # schema. Keep those meanings separate.
     if destination == "snowflake":
         if credentials.get("role"):
             result["_connection_role"] = credentials["role"]
@@ -194,9 +191,6 @@ def _backtick_identifier(value: Any) -> str:
     return "`" + str(value).replace("`", "``") + "`"
 
 
-# Deliberately identical to the identifier atom of _RELATION_PATTERN in
-# evaluation/db_connectors.py (no "$"), so every name the reset accepts is
-# also rewritable by the evaluator.
 _SNOWFLAKE_UNQUOTED = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
 
@@ -226,7 +220,7 @@ def prepare_destination(
     credential_path: str | Path | None = None,
 ) -> str:
     """Drop and recreate the task namespace, returning its qualified name."""
-    get_destination(destination)  # unknown destination is a caller bug, not a prep failure
+    get_destination(destination)
     task_input_dir = Path(task_input_dir).expanduser().resolve()
     try:
         config = _load_destination_config(destination, task_input_dir, credential_path)

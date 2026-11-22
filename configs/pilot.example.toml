@@ -1,17 +1,11 @@
-# This file documents the intended configuration surface. The CLI that loads it
-# is a build-plan item and does not exist yet.
 
 [taskgen]
-# Use a reviewed, immutable installation/digest in training. A mutable sibling
-# checkout is acceptable only while developing the adapter.
 root = "../ELT-taskgen"
 release_dir = "/absolute/path/to/a/public-private/bundle"
 require_combined_layout = true
 require_accepted_tasks = true
 
 [corpus]
-# Discover matching public/private parent task directories. Read family_id from
-# private TaskIR and the destination from public config.yaml, not folder names.
 train_split = "train"
 eval_split = "validation"
 family_disjoint = true
@@ -37,7 +31,6 @@ remove_constant_reward_groups = false
 [tinker]
 model_name = "replace-with-an-admitted-tinker-model"
 project = "elt-environment-pilot"
-# TINKER_API_KEY is injected through the process environment.
 
 [checkpoint]
 directory = ".state/checkpoints"

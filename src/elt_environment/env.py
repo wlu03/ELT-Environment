@@ -145,8 +145,6 @@ class EltEnv(Env):
                     next_stop_condition=self.stop_condition,
                     metrics={},
                 )
-            # Quiesce tools before reading files, including when the call budget
-            # is exhausted. Grade the completed project, not the final prose.
             await self.session.stop_worker()
             try:
                 files = self.session.artifact()
@@ -158,8 +156,6 @@ class EltEnv(Env):
             try:
                 outcome = await asyncio.shield(grading)
             except asyncio.CancelledError:
-                # A grader thread cannot be cancelled. Keep the runtime lease
-                # until it returns before allowing another warehouse reset.
                 await grading
                 raise
             reward = require_tinker_reward(outcome)

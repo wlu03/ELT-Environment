@@ -88,7 +88,6 @@ class Request:
     def render(self, renderer):
         messages = list(self.messages)
         if self.tools:
-            # Merge only the initial system messages; preserve later message order.
             system = []
             while messages and messages[0]["role"] == "system":
                 system.append(text_content(messages.pop(0)["content"]))
@@ -134,8 +133,6 @@ def parse_request(protocol: str, body: dict) -> Request:
             raise ValueError(f"unsupported tool type: {kind}")
     choice = body.get("tool_choice", "auto")
     if choice not in ("auto", None) and choice != {"type": "auto"}:
-        # Forced selection needs constrained decoding; pretending to enforce it
-        # would change the policy distribution recorded by the RL sampler.
         raise ValueError("only automatic tool selection is supported")
 
     if protocol == "chat":
@@ -226,7 +223,6 @@ def parse_request(protocol: str, body: dict) -> Request:
                     }
                 )
             elif kind == "reasoning":
-                # Our gateway emits no opaque/encrypted reasoning items.
                 if item.get("encrypted_content"):
                     raise ValueError("encrypted reasoning cannot be rendered")
                 messages.append(

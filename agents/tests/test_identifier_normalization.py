@@ -61,7 +61,6 @@ def load_db_connectors():
 class SnowflakeIdentifierNormalizationTest(unittest.TestCase):
     def test_helper_matches_evaluator_for_all_committed_configs(self):
         db_connectors = load_db_connectors()
-        # No credentials needed: the connection is lazy (BaseConnector.conn).
         connector = db_connectors.SnowflakeConnector({})
         config_paths = sorted(
             (REPO_ROOT / "elt-bench" / "snowflake").glob("*/config.yaml")
@@ -69,8 +68,6 @@ class SnowflakeIdentifierNormalizationTest(unittest.TestCase):
         self.assertTrue(config_paths, "no committed snowflake configs found")
         for config_path in config_paths:
             with self.subTest(task=config_path.parent.name):
-                # A parse failure here fails the subTest: this doubles as a
-                # strict-parse gate for every committed config.yaml.
                 with config_path.open(encoding="utf-8") as handle:
                     config = yaml.safe_load(handle)
                 destination_config = config["snowflake"]["config"]

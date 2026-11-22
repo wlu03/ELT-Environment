@@ -35,8 +35,6 @@ def load(path: Path):
 
 
 def run_spider(spec: dict, root: Path):
-    # Replace only call_llm; importing upstream models.py would load every
-    # commercial provider even though no such provider is used here.
     module = types.ModuleType("spider_agent.agent.models")
 
     def call_llm(body):
@@ -63,7 +61,6 @@ def run_spider(spec: dict, root: Path):
         public_input,
         ignore=shutil.ignore_patterns("*_credential.json"),
     )
-    # The instruction and agent/environment classes are the upstream runner's.
     instruction = (
         "You are required to build an ELT pipeline by extracting data from multiple sources, "
         "such as custom APIs, Postgres, MongoDB, flat files and cloud service S3. The extracted "
@@ -137,11 +134,7 @@ def run_swe(spec: dict, root: Path):
     empty_env.touch()
     config["env_var_path"] = str(empty_env)
     os.chdir(root / "SWE-agent")
-    # The framework owns history, tools, retries and termination. Its shell
-    # runs in the same /workspace bind mount used by the other agents.
     run = RunSingle.from_config(RunSingleConfig.model_validate(config))
-    # Resource naming only: let the coordinator reap the exact deployment if
-    # this worker is cancelled before the upstream cleanup hook can run.
     run.env.deployment._get_container_name = lambda: spec["container_name"]
     try:
         run.run()
@@ -187,7 +180,6 @@ async def run_sdk(spec: dict, root: Path):
     out_dir = Path(spec["workspace"])
     out_dir.mkdir(parents=True, exist_ok=True)
     result = out_dir / (agent if agent != "codex" else "codex") / "result.json"
-    # Call the original task body, with the same prompts, tools and SDK loop.
     await upstream._run_task_body(
         db=spec["task_id"],
         destination=spec["destination"],
@@ -198,11 +190,8 @@ async def run_sdk(spec: dict, root: Path):
         result_path=result,
         inputs_root=Path(spec["inputs_root"]),
         model=model,
-        # Leave call N+1 reachable so the coordinator's budget wins before
-        # an SDK turn-limit exception can obscure the final tool results.
         max_turns=spec["max_turns"] + 1,
     )
-    # Keep coordinator status outside the writable agent mount.
     result_data = json.loads(result.read_text())
     Path(spec["result_file"]).write_text(json.dumps(result_data))
     if not result_data.get("finished", False):
