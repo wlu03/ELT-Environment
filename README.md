@@ -54,6 +54,11 @@ and Redshift destinations. See each folder's requirements and Docker build files
 - `max_steps` bounds training updates. 
 - `max_tokens` applies to each sampled reply.
 
+Training shows an overall progress bar with completed steps, elapsed time and
+estimated time remaining, alongside the per-batch sampling bar. It respects
+`max_steps` and resumes from the checkpoint's completed step count. Add
+`progress_bar=false` to disable the overall bar.
+
 Family holdouts remain separate from training. Probes save every sampled turn,
 its token IDs, log probabilities and terminal reward.
 
@@ -67,6 +72,60 @@ The original runners reset the configured warehouse namespace. Attempts sharing
 an `inputs_root` are serialized using a host file lock, through grading and cleanup.
 Use one installed input root per runtime; separate hosts need separate runtime
 resources. Parallel warehouse provisioning is not implemented.
+
+### DuckDB development target
+
+Use `agent=swe` and replace the warehouse section of both the task's public
+config and installed development config with:
+
+```yaml
+duckdb:
+  config:
+    definition_id: 94bd199c-2ff0-4aa2-b98e-17f0acb72610
+    schema: main
+```
+
+Use the DuckDB connector definition ID in your Airbyte workspace. For sources
+that emit global checkpoints, including MongoDB, build and register the
+patched connector at `runtime/airbyte-duckdb/Dockerfile`. Use that custom
+definition ID in both the public and installed configs. Keep the Airbyte
+workspace and source settings in the installed development config.
+Install the scoped workspace credentials and seed development data before
+running a probe. The public bundle contains task inputs and templates.
+
+Build the DuckDB solver image from the existing `elt-swe` image.
+
+```bash
+docker build -t elt-swe-duckdb -f agents/SWE-agent/docker/elt-swe/DuckDB.Dockerfile agents/SWE-agent/docker/elt-swe
+```
+
+Set `duckdb_local_root` to a dedicated host directory mounted as `/local` in
+the Airbyte destination worker. The host user and the Airbyte worker need
+write access through the mount. The solver receives only its attempt's
+subdirectory at `/duckdb`. Use Airbyte access scoped to the development
+workspace and restrict destination writes to the attempt directory.
+
+Airbyte and the solver use the same `warehouse.duckdb` file. Finish each
+Airbyte sync before starting the next sync or running dbt. With the DuckDB
+destination, source rows land in `_airbyte_raw_<stream>` as JSON in
+`_airbyte_data`. Use `profile: elt_environment` and `dbt run --profiles-dir
+/workspace` to build the models in `elt_models`.
+
+Run the bundled DuckDB replay grader with the same Python environment as the
+coordinator.
+
+```bash
+grader_command='/absolute/path/to/.venv/bin/python -m elt_environment.duckdb_grader --runtime /private/attempt-runtime.json'
+```
+
+The private runtime JSON describes one provisioned task. Set `release_dir`,
+`task_id`, `workspace_id`, `definition_id`, `local_root`, `airbyte_url`, and
+`airbyte_credentials_file` (a file containing the Airbyte client ID and
+secret). Set `development` to the serialized taskgen `SourceEnvironment`
+used to seed that workspace. The grader reuses the attempt's Terraform
+connections in the task-owned workspace. It stops development, syncs each
+hidden population into a fresh DuckDB file, checks raw row counts, and runs
+dbt without network access. Give this runtime one live rollout at a time.
 
 ## Grading
 
@@ -90,6 +149,9 @@ For an infrastructure or harness fault:
 ```
 
 Faults discard and resample the entire GRPO group; they never become zero rewards.
+DuckDB requests include a private `runtime` object with the attempt storage
+path and the Airbyte connection IDs found in Terraform state. The grader
+intersects those IDs with the task workspace's registered connections.
 The grader request, release private tree and results stay outside the agent mount.
 The agent sees only the installed task workspace and its development services.
 

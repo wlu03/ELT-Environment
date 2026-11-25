@@ -60,6 +60,8 @@ class ProbeConfig:
     max_turns: int = 100
     agent_timeout_s: float = 7200
     agent_image: str | None = None
+    duckdb_local_root: str | None = None
+    duckdb_control_port: int | None = None
     agent_network: str = "elt-docker_elt_network"
     bridge_bind_host: str = "127.0.0.1"
     bridge_container_host: str = "host.docker.internal"
@@ -73,6 +75,7 @@ class ProbeConfig:
     tasks: int = 6
     task_ids: str | None = None
     samples: int = 4
+    max_group_attempts: int = 3
     eval_families: int = 5
     seed: int = 0
     grader_concurrency: int = 8
@@ -104,8 +107,8 @@ def choose_tasks(train: Sequence[TaskRef], count: int, task_ids: str | None) -> 
 async def probe(config: ProbeConfig) -> dict:
     """Grade ``samples`` agent attempts per chosen task and summarize rewards."""
 
-    if config.samples < 1:
-        raise ValueError("samples must be at least 1")
+    if min(config.samples, config.max_group_attempts) < 1:
+        raise ValueError("samples and max_group_attempts must be at least 1")
     check_run(config)
     renderer_name = config.renderer_name or default_renderer_name(config.model_name)
     renderer = cached_renderer(config.model_name, renderer_name)
@@ -129,7 +132,7 @@ async def probe(config: ProbeConfig) -> dict:
     policy = TinkerTokenCompleter(
         sampling, max_tokens=config.max_tokens, temperature=config.temperature
     )
-    strategy = RetryWholeGroup(max_attempts=3)
+    strategy = RetryWholeGroup(max_attempts=config.max_group_attempts)
 
     async def one(task) -> dict:
         builder = EltGroupBuilder(
@@ -152,12 +155,19 @@ async def probe(config: ProbeConfig) -> dict:
             last = trajectory.transitions[-1]
             turns = []
             for transition in trajectory.transitions:
-                message, _ = renderer.parse_response(transition.ac.tokens)
+                truncated = bool(transition.metrics.get("output_truncated"))
+                if truncated:
+                    message, termination = None, "length"
+                else:
+                    parsed, termination = renderer.parse_response(transition.ac.tokens)
+                    message = renderer.to_openai_message(parsed)
                 turns.append(
                     {
-                        "message": renderer.to_openai_message(message),
+                        "message": message,
                         "tokens": transition.ac.tokens,
                         "logprobs": transition.ac.logprobs,
+                        "parse_termination": str(termination),
+                        "output_truncated": truncated,
                         "reward": transition.reward,
                     }
                 )
@@ -173,7 +183,7 @@ async def probe(config: ProbeConfig) -> dict:
     phases = collections.Counter(
         next(
             (k[len("phase_") :] for k, v in m.items() if k.startswith("phase_") and v == 1.0),
-            "format",
+            "policy" if m.get("policy_violation") else "format",
         )
         for m in all_metrics
     )
@@ -185,14 +195,20 @@ async def probe(config: ProbeConfig) -> dict:
         "rollouts": rollouts,
         "mean_reward": sum(sum(r["rewards"]) for r in scored) / max(1, rollouts),
         "el_pass_rate": sum(m.get("el_pass", 0.0) for m in all_metrics) / max(1, rollouts),
+        "mean_transform_reward": sum(m.get("r_t", 0.0) for m in all_metrics) / max(1, rollouts),
         "full_reward_rate": sum(1 for r in scored for x in r["rewards"] if x == 1.0)
         / max(1, rollouts),
         "format_error_rate": sum(m.get("format_error", 0.0) for m in all_metrics)
+        / max(1, rollouts),
+        "output_truncation_rate": sum(m.get("output_truncated", 0.0) for m in all_metrics)
+        / max(1, rollouts),
+        "policy_violation_rate": sum(m.get("policy_violation", 0.0) for m in all_metrics)
         / max(1, rollouts),
         "first_failed_phase": dict(phases),
         "groups_with_reward_variance": sum(1 for r in scored if len(set(r["rewards"])) > 1),
         "groups_discarded": len(results) - len(scored),
         "per_task": {r["task_id"]: r.get("rewards", r.get("discarded")) for r in results},
+        "metrics_by_task": {r["task_id"]: r["metrics"] for r in scored},
         "replies": str(out_dir),
     }
     out_dir.mkdir(parents=True, exist_ok=True)

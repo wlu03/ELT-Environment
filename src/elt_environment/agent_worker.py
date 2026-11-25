@@ -10,9 +10,11 @@ import asyncio
 import importlib.util
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import sys
+import time
 import types
 import urllib.request
 from pathlib import Path
@@ -107,11 +109,34 @@ def run_swe(spec: dict, root: Path):
     from common import prepare_destination
     from sweagent.run.run_single import RunSingle, RunSingleConfig
 
-    prepare_destination(spec["destination"], Path(spec["inputs_root"]) / spec["task_id"])
-    upstream.copy_task_input(Path(spec["inputs_root"]) / spec["task_id"], Path(spec["workspace"]))
+    inputs = Path(spec["inputs_root"]) / spec["task_id"]
+    duckdb = spec["destination"] == "duckdb"
+    if not duckdb:
+        prepare_destination(spec["destination"], inputs)
+    upstream.copy_task_input(inputs, Path(spec["workspace"]))
     config_path = Path(spec["attempt_root"]) / "swe.yaml"
     upstream.write_destination_config(spec["destination"], config_path)
     config = yaml.safe_load(config_path.read_text())
+    docker_args = ["--network", spec["network"], "-v", spec["workspace"] + ":/workspace"]
+    if duckdb:
+        docker_args.extend(["-v", spec["duckdb_storage"] + ":/duckdb"])
+        config["agent"]["templates"]["instance_template"] += """
+
+For this DuckDB task, use duckdb.config from /workspace/config.yaml for the Airbyte
+destination definition UUID, destination_path, and schema. Airbyte writes to
+the /local/... path from config.yaml. Use /duckdb/warehouse.duckdb for solver
+queries and dbt. With Airbyte provider
+0.6.5, use airbyte_destination_custom and JSON-encode the destination_path and
+schema in its configuration. Set the connection
+namespace to the destination, use the original stream names, and run one sync
+at a time. Wait for each sync to finish before starting the next or opening dbt.
+The connector writes <schema>._airbyte_raw_<stream> with a JSON _airbyte_data
+column. Extract and cast source fields from that JSON in your models or staging
+queries. The loader and dbt share the same file at /duckdb/warehouse.duckdb.
+Keep the dbt project in /workspace/elt or in a new directory directly under
+/workspace. Set profile: elt_environment in dbt_project.yml and pass
+--profiles-dir /workspace to dbt. The installed profile writes to elt_models.
+"""
     config.setdefault("agent", {})["model"] = {
         "name": "openai/gpt-4.1",
         "api_base": spec["host_url"],
@@ -120,13 +145,12 @@ def run_swe(spec: dict, root: Path):
         "total_cost_limit": 0,
         "completion_kwargs": {"max_tokens": spec["max_tokens"]},
     }
+    deployment = {"type": "docker", "image": spec["image"], "docker_args": docker_args}
+    if duckdb and spec.get("duckdb_control_port"):
+        deployment = start_private_swe(spec, docker_args)
     config["env"] = {
         "repo": {"type": "preexisting", "repo_name": "workspace"},
-        "deployment": {
-            "type": "docker",
-            "image": spec["image"],
-            "docker_args": ["--network", spec["network"], "-v", spec["workspace"] + ":/workspace"],
-        },
+        "deployment": deployment,
     }
     config["problem_statement"] = {"type": "empty", "id": spec["task_id"]}
     config["output_dir"] = str(Path(spec["attempt_root"]) / "swe-results")
@@ -135,11 +159,45 @@ def run_swe(spec: dict, root: Path):
     config["env_var_path"] = str(empty_env)
     os.chdir(root / "SWE-agent")
     run = RunSingle.from_config(RunSingleConfig.model_validate(config))
-    run.env.deployment._get_container_name = lambda: spec["container_name"]
+    if deployment["type"] == "docker":
+        run.env.deployment._get_container_name = lambda: spec["container_name"]
     try:
         run.run()
     finally:
         run.env.close()
+
+
+def start_private_swe(spec: dict, docker_args: list[str]) -> dict:
+    token = secrets.token_urlsafe(32)
+    name = spec["container_name"]
+    command = [
+        "docker", "run", "--rm", "--detach", "--pull=never",
+        "--name", name, "--network-alias", "elt-solver",
+        "--cap-drop=ALL", "--security-opt=no-new-privileges", "--pids-limit=256",
+        "--memory=4g", "--cpus=2", "--read-only",
+        "--tmpfs", "/tmp:rw,exec,nosuid,size=512m",
+        "--tmpfs", "/root:rw,exec,nosuid,size=64m",
+        *docker_args, "--entrypoint", "swerex-remote", spec["image"], "--auth-token", token,
+    ]
+    host, port = "http://127.0.0.1", spec["duckdb_control_port"]
+    request = urllib.request.Request(f"{host}:{port}/is_alive", headers={"X-API-Key": token})
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    for _ in range(2):
+        result = subprocess.run(command, capture_output=True, timeout=45)
+        if result.returncode:
+            raise RuntimeError(f"could not start private SWE-ReX (Docker exit {result.returncode})")
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            try:
+                with opener.open(request, timeout=2) as response:
+                    if response.status == 200:
+                        return {"type": "remote", "host": host, "port": port, "auth_token": token,
+                                "timeout": 30}
+            except OSError:
+                pass
+            time.sleep(0.5)
+        subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=20)
+    raise RuntimeError("private SWE-ReX did not become ready after two starts")
 
 
 async def run_sdk(spec: dict, root: Path):

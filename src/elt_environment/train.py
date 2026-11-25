@@ -19,6 +19,7 @@ from tinker_cookbook import cli_utils, model_info
 from tinker_cookbook.rl.train import Config, main
 
 from elt_environment.env import EltDatasetBuilder, RetryWholeGroup
+from elt_environment.progress import training_progress
 from elt_environment.runner import AgentConfig, preflight
 from elt_environment.tasks import discover_tasks
 
@@ -41,6 +42,7 @@ class CLIConfig:
     max_turns: int = 100
     agent_timeout_s: float = 7200
     agent_image: str | None = None
+    duckdb_local_root: str | None = None
     agent_network: str = "elt-docker_elt_network"
     bridge_bind_host: str = "127.0.0.1"
     bridge_container_host: str = "host.docker.internal"
@@ -54,6 +56,7 @@ class CLIConfig:
     groups_per_batch: int = 8
     epochs: int = 4
     max_steps: int | None = None
+    progress_bar: bool = True
     max_tokens: int = 10240
     temperature: float = 1.0
     eval_families: int = 5
@@ -143,7 +146,8 @@ async def cli_main(cli: CLIConfig) -> None:
     config = build_config(cli)
     cli_utils.check_log_dir(config.log_path, behavior_if_exists=cli.behavior_if_log_dir_exists)
     logger.info("log path: %s", config.log_path)
-    await main(config)
+    with training_progress(cli.progress_bar):
+        await main(config)
 
 
 def agent_config(cli) -> AgentConfig:
@@ -156,6 +160,8 @@ def agent_config(cli) -> AgentConfig:
         context_length=cli.context_length,
         timeout_s=cli.agent_timeout_s,
         image=cli.agent_image,
+        duckdb_local_root=cli.duckdb_local_root,
+        duckdb_control_port=getattr(cli, "duckdb_control_port", None),
         network=cli.agent_network,
         bridge_bind_host=cli.bridge_bind_host,
         bridge_container_host=cli.bridge_container_host,
