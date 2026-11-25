@@ -1,5 +1,9 @@
 # Environment architecture
 
+> Historical design notes: the single-reply pilot described below has been
+> replaced by the vendored-agent provider bridge. See [README](../README.md)
+> for the implemented flow, runtime requirements and current grading limits.
+
 ## Decision
 
 Build `ELT-Environment` as a thin Tinker coordinator around the verified
@@ -38,7 +42,7 @@ artifact, numeric heads, and sanitized status codes.
 
 | Concern | Authority |
 | --- | --- |
-| Task generation, acceptance, release verification | `ELT-taskgen` |
+| Task generation and acceptance | `ELT-taskgen` |
 | TaskIR, populations, gold, attacks | `ELT-taskgen` private release |
 | Workspace admission/sealing/replay | `elt_taskgen.training.workspace` |
 | Terraform intent and trusted sync | `elt_taskgen.training` |
@@ -92,13 +96,13 @@ The parser ignores text outside the blocks and returns each block's content
 unchanged. It refuses a reply with no block, an unterminated block, a path
 outside `elt/`, a path with an empty, `.` or `..` segment, a backslash or a
 control character, or a repeated path. It performs no repair. Unicode and
-case collisions and the file and byte caps are enforced by taskgen's
-`DeclarativeEltEnv` before grading. The reply is an adapter format only; the
-authoritative submission is the sealed workspace artifact.
+case collisions and the file and byte caps are enforced by the configured
+trusted grader. The reply is an adapter format only; the authoritative
+submission is the sealed workspace artifact.
 
 `initial_observation()` contains the approved public task, exact response
-schema, limits, and no hidden facts. `step()` parses once, calls the existing
-one-step `DeclarativeEltEnv`, returns a float only for a real label, and ends
+schema, limits, and no hidden facts. `step()` parses once, calls the configured
+hidden-replay grader, returns a float only for a real label, and ends
 the episode.
 
 ### L2: interactive agent target
@@ -198,7 +202,8 @@ task. `make_envs()` lazily creates `group_size` independent attempts for that
 same task. Heavy clients, package objects, database handles, locks, and event
 loops are created in the worker, not serialized in the builder.
 
-Catalog selection is manifest-driven and records:
+Catalog discovery reads parent task IDs and families from private TaskIR and
+destinations from public configs. A reproducible run should record:
 
 - release and package digests;
 - parent task, origin, family, cluster, destination, and difficulty strata;
@@ -233,7 +238,7 @@ A resumable run needs more than model weights:
 - Tinker sampler checkpoint;
 - Tinker training/optimizer checkpoint;
 - dataset cursor, shuffle seed, and task sampler RNG;
-- release manifest/package digest and admitted task IDs;
+- bundle content digests and admitted task IDs;
 - model/tokenizer, renderer, action, environment, scorer, and reward versions;
 - group retry and concurrency configuration;
 - completed evaluation step IDs and aggregate metrics.

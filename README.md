@@ -16,7 +16,7 @@ uv sync
 TINKER_API_KEY=urapikey
 TINKER_PROJECT_ID=urprojectid
 ```
-3. Put your `training-data/<name>`. Keep each training data the same as `ELT-taskgen`. Visit that [repo](github.com/wlu03/ELT-taskgen). `public/` should be the agent facing files and `private/` keeps all of the verifiers and evaluators. 
+3. Put taskgen bundles under `training-data/<name>/`, with matching `public/<task_id>/` and `private/<task_id>/` directories. Discovery reads `family_id` from private `task_ir.json` (or `semantic/task_ir.json`) and the destination from public `config.yaml`. Public EL/T variants without a private parent record are not separate training examples. You can also point `releases_root` at a single bundle.
 
 4. Install the Codex runner's requirements in a separate Python env. Build its `elt-swe` Docker image using the instructions under `agents/`. Pass the environment's Python interpreter as `agent_python`. 
 
@@ -54,6 +54,11 @@ and Redshift destinations. See each folder's requirements and Docker build files
 - `max_steps` bounds training updates. 
 - `max_tokens` applies to each sampled reply.
 
+Training shows an overall progress bar with completed steps, elapsed time and
+estimated time remaining, alongside the per-batch sampling bar. It respects
+`max_steps` and resumes from the checkpoint's completed step count. Add
+`progress_bar=false` to disable the overall bar.
+
 Family holdouts remain separate from training. Probes save every sampled turn,
 its token IDs, log probabilities and terminal reward.
 
@@ -67,6 +72,60 @@ The original runners reset the configured warehouse namespace. Attempts sharing
 an `inputs_root` are serialized using a host file lock, through grading and cleanup.
 Use one installed input root per runtime; separate hosts need separate runtime
 resources. Parallel warehouse provisioning is not implemented.
+
+### DuckDB development target
+
+Use `agent=swe` and replace the warehouse section of both the task's public
+config and installed development config with:
+
+```yaml
+duckdb:
+  config:
+    definition_id: 94bd199c-2ff0-4aa2-b98e-17f0acb72610
+    schema: main
+```
+
+Use the DuckDB connector definition ID in your Airbyte workspace. For sources
+that emit global checkpoints, including MongoDB, build and register the
+patched connector at `runtime/airbyte-duckdb/Dockerfile`. Use that custom
+definition ID in both the public and installed configs. Keep the Airbyte
+workspace and source settings in the installed development config.
+Install the scoped workspace credentials and seed development data before
+running a probe. The public bundle contains task inputs and templates.
+
+Build the DuckDB solver image from the existing `elt-swe` image.
+
+```bash
+docker build -t elt-swe-duckdb -f agents/SWE-agent/docker/elt-swe/DuckDB.Dockerfile agents/SWE-agent/docker/elt-swe
+```
+
+Set `duckdb_local_root` to a dedicated host directory mounted as `/local` in
+the Airbyte destination worker. The host user and the Airbyte worker need
+write access through the mount. The solver receives only its attempt's
+subdirectory at `/duckdb`. Use Airbyte access scoped to the development
+workspace and restrict destination writes to the attempt directory.
+
+Airbyte and the solver use the same `warehouse.duckdb` file. Finish each
+Airbyte sync before starting the next sync or running dbt. With the DuckDB
+destination, source rows land in `_airbyte_raw_<stream>` as JSON in
+`_airbyte_data`. Use `profile: elt_environment` and `dbt run --profiles-dir
+/workspace` to build the models in `elt_models`.
+
+Run the bundled DuckDB replay grader with the same Python environment as the
+coordinator.
+
+```bash
+grader_command='/absolute/path/to/.venv/bin/python -m elt_environment.duckdb_grader --runtime /private/attempt-runtime.json'
+```
+
+The private runtime JSON describes one provisioned task. Set `release_dir`,
+`task_id`, `workspace_id`, `definition_id`, `local_root`, `airbyte_url`, and
+`airbyte_credentials_file` (a file containing the Airbyte client ID and
+secret). Set `development` to the serialized taskgen `SourceEnvironment`
+used to seed that workspace. The grader reuses the attempt's Terraform
+connections in the task-owned workspace. It stops development, syncs each
+hidden population into a fresh DuckDB file, checks raw row counts, and runs
+dbt without network access. Give this runtime one live rollout at a time.
 
 ## Grading
 
@@ -90,14 +149,17 @@ For an infrastructure or harness fault:
 ```
 
 Faults discard and resample the entire GRPO group; they never become zero rewards.
+DuckDB requests include a private `runtime` object with the attempt storage
+path and the Airbyte connection IDs found in Terraform state. The grader
+intersects those IDs with the task workspace's registered connections.
 The grader request, release private tree and results stay outside the agent mount.
 The agent sees only the installed task workspace and its development services.
 
-For an explicit **offline diagnostic**, omit `grader_command` and set
-`allow_declarative_grader=true`. This selects the existing taskgen DuckDB replay
-scorer. It enforces a narrower Terraform/SQL contract than the copied agents:
-valid real-cloud solutions can fail this scorer. It should not be used to claim
-ELT-Bench-equivalent pass rates. There is no silent fallback to it.
+`grader_command` is required for training and probes. The grader owns validation
+of private replay assets and must report missing or invalid assets as an
+unlabelled outcome. Admission checks task metadata and installed development
+inputs; it does not certify hidden replay assets. Keep bundles immutable during
+a run. There is no bundled offline diagnostic scorer.
 
 ## Checks and limits
 
@@ -131,7 +193,7 @@ src/elt_environment/
   bridge.py                   provider requests <-> Tinker observations/actions
   runner.py                   workspace, runtime lock, process and container cleanup
   env.py                      multi-turn Cookbook environment and group retries
-  grading.py                  trusted grader command or explicit offline diagnostic
+  grading.py                  trusted hidden-replay grader command
   admission.py, tasks.py      verify inputs, discover tasks and split families
   train.py, probe.py          training and evaluation entry points
 .state/                        private attempts, worker logs and training output

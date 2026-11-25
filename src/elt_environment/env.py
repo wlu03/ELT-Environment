@@ -33,10 +33,10 @@ from tinker_cookbook.utils import logtree
 from tinker_cookbook.utils.logtree_formatters import ConversationFormatter
 
 from elt_environment.admission import admit_tasks
-from elt_environment.artifact import ArtifactFormatError, parse_artifact
 from elt_environment.grading import GraderConfig, grade_artifact
 from elt_environment.outcomes import DiscardGroupSignal, GraderOutcome, require_tinker_reward
-from elt_environment.prompt import build_messages
+from elt_environment.protocol import completion
+from elt_environment.runner import AgentConfig, AgentFault, AgentSession, SubmissionViolation
 from elt_environment.tasks import TaskRef, discover_tasks, split_by_family
 
 logger = logging.getLogger(__name__)
@@ -49,13 +49,14 @@ def cached_renderer(model_name: str, renderer_name: str) -> renderers.Renderer:
     return renderers.get_renderer(renderer_name, tokenizer=get_tokenizer(model_name))
 
 
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _grader_pool(workers: int) -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=workers, thread_name_prefix="elt-grader")
 
 
 async def run_grader(
-    task: TaskRef, files: Mapping[str, str], grader: GraderConfig, workers: int
+    task: TaskRef, files: Mapping[str, str], grader: GraderConfig, workers: int,
+    runtime: dict | None = None,
 ) -> GraderOutcome:
     """Grade on a shared pool of ``workers`` threads and return the outcome.
 
@@ -65,32 +66,46 @@ async def run_grader(
     """
 
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_grader_pool(workers), grade_artifact, task, files, grader)
+    args = (task, files, grader) if runtime is None else (task, files, grader, runtime)
+    return await loop.run_in_executor(_grader_pool(workers), grade_artifact, *args)
 
 
 class EltEnv(Env):
-    """One attempt at one task: the policy writes the whole artifact in a single reply."""
+    """One original agent session; every model request is a sampled RL step."""
 
     def __init__(
         self,
         task: TaskRef,
-        messages: list[renderers.Message],
         renderer: renderers.Renderer,
         grader: GraderConfig,
         grader_concurrency: int,
+        agent: AgentConfig,
+        session_factory=AgentSession,
     ) -> None:
         self.task = task
-        self.messages = messages
         self.renderer = renderer
         self.grader = grader
         self.grader_concurrency = grader_concurrency
+        self.agent = agent
+        self.session = session_factory(task, renderer, agent)
+        self.pending = None
+        self.turns = 0
 
     @property
     def stop_condition(self) -> StopCondition:
         return self.renderer.get_stop_sequences()
 
     async def initial_observation(self) -> tuple[Observation, StopCondition]:
-        return self.renderer.build_generation_prompt(self.messages), self.stop_condition
+        try:
+            await self.session.start()
+            self.pending = await self.session.next_request()
+            if self.pending is None:
+                raise AgentFault("agent_finished_without_sampling")
+            if self.pending.observation.length + self.agent.max_tokens > self.agent.context_length:
+                raise AgentFault("initial_prompt_over_context")
+            return self.pending.observation, self.stop_condition
+        except AgentFault as error:
+            raise DiscardGroupSignal(str(error)) from error
 
     def _final(self, reward: float, metrics: Metrics) -> StepResult:
         return StepResult(
@@ -102,16 +117,75 @@ class EltEnv(Env):
         )
 
     async def step(self, action: Action, *, extra: ActionExtra | None = None) -> StepResult:
-        message, _ = self.renderer.parse_response(action)
+        self.turns += 1
+        stop_reason = (extra or {}).get("stop_reason")
+        if stop_reason == "length":
+            return await self._grade_workspace(budget=True, truncated=True)
+
+        message, termination = self.renderer.parse_response(action)
         with logtree.scope_header("Policy Response"):
             logtree.log_formatter(ConversationFormatter(messages=[message]))
+        if message.get("unparsed_tool_calls") or not termination.is_clean:
+            if stop_reason is None and len(action) >= self.agent.max_tokens:
+                return await self._grade_workspace(budget=True, truncated=True)
+            return self._final(0.0, {"format_error": 1.0, "model_calls": float(self.turns)})
         try:
-            files = parse_artifact(renderers.get_text_content(message))
-        except ArtifactFormatError:
-            return self._final(0.0, {"format_error": 1.0, "r_el": 0.0, "r_t": 0.0, "el_pass": 0.0})
-        outcome = await run_grader(self.task, files, self.grader, self.grader_concurrency)
-        reward = require_tinker_reward(outcome)
-        return self._final(reward, {"format_error": 0.0, **outcome.metrics})
+            reply = completion(
+                self.pending.request, message, self.pending.observation.length, len(action)
+            )
+        except (ValueError, TypeError):
+            return self._final(0.0, {"format_error": 1.0, "model_calls": float(self.turns)})
+        if self.pending.reply.done():
+            raise DiscardGroupSignal("provider_connection_lost")
+        self.pending.reply.set_result(reply)
+        try:
+            self.pending = await self.session.next_request()
+            budget = self.turns >= self.agent.max_turns or (
+                self.pending is not None
+                and self.pending.observation.length + self.agent.max_tokens
+                > self.agent.context_length
+            )
+            if self.pending is not None and not budget:
+                return StepResult(
+                    reward=0.0,
+                    episode_done=False,
+                    next_observation=self.pending.observation,
+                    next_stop_condition=self.stop_condition,
+                    metrics={},
+                )
+            return await self._grade_workspace(budget=budget)
+        except AgentFault as error:
+            raise DiscardGroupSignal(str(error)) from error
+
+    async def _grade_workspace(self, *, budget: bool, truncated: bool = False) -> StepResult:
+        metrics = {
+            "format_error": 0.0,
+            "model_calls": float(self.turns),
+            "agent_budget_exhausted": float(budget),
+            "output_truncated": float(truncated),
+        }
+        try:
+            await self.session.stop_worker()
+            try:
+                files = self.session.artifact()
+            except SubmissionViolation:
+                return self._final(0.0, {**metrics, "policy_violation": 1.0})
+            grader_args = (self.task, files, self.grader, self.grader_concurrency)
+            if self.task.destination == "duckdb":
+                grader_args += (self.session.duckdb_replay_receipt(),)
+            grading = asyncio.create_task(run_grader(*grader_args))
+            try:
+                outcome = await asyncio.shield(grading)
+            except asyncio.CancelledError:
+                await grading
+                raise
+            reward = require_tinker_reward(outcome)
+            return self._final(reward, {**metrics, **outcome.metrics})
+        except AgentFault as error:
+            raise DiscardGroupSignal(str(error)) from error
+
+    async def close(self):
+        await self.session.close()
 
 
 @dataclass(frozen=True)
@@ -124,12 +198,12 @@ class EltGroupBuilder(EnvGroupBuilder):
     renderer_name: str
     grader: GraderConfig
     grader_concurrency: int
+    agent: AgentConfig
 
     async def make_envs(self) -> Sequence[Env]:
         renderer = cached_renderer(self.model_name, self.renderer_name)
-        messages = build_messages(self.task)
         return [
-            EltEnv(self.task, messages, renderer, self.grader, self.grader_concurrency)
+            EltEnv(self.task, renderer, self.grader, self.grader_concurrency, self.agent)
             for _ in range(self.group_size)
         ]
 
@@ -170,9 +244,20 @@ class RetryWholeGroup(RolloutStrategy):
         errors: list[RolloutError] = []
         for _ in range(self.max_attempts):
             envs = await env_group_builder.make_envs()
-            results = await asyncio.gather(
-                *(do_single_rollout(policy, env) for env in envs), return_exceptions=True
-            )
+
+            async def rollout(env):
+                try:
+                    return await do_single_rollout(policy, env)
+                finally:
+                    if hasattr(env, "close"):
+                        cleanup = asyncio.create_task(env.close())
+                        try:
+                            await asyncio.shield(cleanup)
+                        except asyncio.CancelledError:
+                            await cleanup
+                            raise
+
+            results = await asyncio.gather(*(rollout(env) for env in envs), return_exceptions=True)
             failures = [result for result in results if isinstance(result, BaseException)]
             for failure in failures:
                 if not isinstance(failure, DiscardGroupSignal):
@@ -232,7 +317,9 @@ class EltDataset(RLDataset):
 
     def get_batch(self, index: int) -> Sequence[EnvGroupBuilder]:
         start = index * self.groups_per_batch
-        return [self.make_builder(task) for task in self.order[start : start + self.groups_per_batch]]
+        return [
+            self.make_builder(task) for task in self.order[start : start + self.groups_per_batch]
+        ]
 
     def __len__(self) -> int:
         return len(self.order) // self.groups_per_batch
@@ -243,7 +330,6 @@ class EltDatasetBuilder(RLDatasetBuilder):
     """Discover releases, admit tasks, split by family, and build train and eval datasets."""
 
     releases_root: str
-    taskgen_root: str
     attempts_root: str
     model_name: str
     renderer_name: str
@@ -256,18 +342,15 @@ class EltDatasetBuilder(RLDatasetBuilder):
     context_length: int = 65536
     grader_concurrency: int = 8
     grader_deadline_s: float | None = None
-    verify_releases: bool = True
+    agent: AgentConfig = AgentConfig()
+    grader_command: tuple[str, ...] = ()
 
     async def __call__(self) -> tuple[EltDataset, EltDataset | None]:
-        renderer = cached_renderer(self.model_name, self.renderer_name)
         tasks = discover_tasks(Path(self.releases_root))
         admitted, excluded = await asyncio.to_thread(
             admit_tasks,
             tasks,
-            renderer,
-            context_length=self.context_length,
-            max_tokens=self.max_tokens,
-            verify=self.verify_releases,
+            agent=self.agent,
         )
         for exclusion in excluded:
             logger.warning("excluded %s: %s", exclusion.task_id, exclusion.reason)
@@ -288,10 +371,9 @@ class EltDatasetBuilder(RLDatasetBuilder):
             ", ".join(task.task_id for task in evaluation),
         )
         grader = GraderConfig(
-            taskgen_root=Path(self.taskgen_root),
             attempts_root=Path(self.attempts_root),
             grader_deadline_s=self.grader_deadline_s,
-            verify_release=self.verify_releases,
+            command=self.grader_command,
         )
 
         def builder(group_size: int) -> Callable[[TaskRef], EltGroupBuilder]:
@@ -302,6 +384,7 @@ class EltDatasetBuilder(RLDatasetBuilder):
                 renderer_name=self.renderer_name,
                 grader=grader,
                 grader_concurrency=self.grader_concurrency,
+                agent=self.agent,
             )
 
         train_dataset = EltDataset(

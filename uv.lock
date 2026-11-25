@@ -348,10 +348,12 @@ name = "elt-environment"
 version = "0.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "aiohttp" },
     { name = "elt-taskgen" },
     { name = "pyyaml" },
     { name = "tinker" },
     { name = "tinker-cookbook" },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -361,11 +363,13 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", specifier = ">=3.14,<4" },
     { name = "elt-taskgen", editable = "../ELT-taskgen" },
     { name = "pyyaml", specifier = ">=6,<7" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12,<1" },
     { name = "tinker", specifier = "==0.27.1" },
     { name = "tinker-cookbook", specifier = "==0.5.7" },
+    { name = "tqdm", specifier = ">=4.67,<5" },
 ]
 provides-extras = ["dev"]
 
