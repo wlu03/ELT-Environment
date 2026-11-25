@@ -54,6 +54,11 @@ and Redshift destinations. See each folder's requirements and Docker build files
 - `max_steps` bounds training updates. 
 - `max_tokens` applies to each sampled reply.
 
+Training shows an overall progress bar with completed steps, elapsed time and
+estimated time remaining, alongside the per-batch sampling bar. It respects
+`max_steps` and resumes from the checkpoint's completed step count. Add
+`progress_bar=false` to disable the overall bar.
+
 Family holdouts remain separate from training. Probes save every sampled turn,
 its token IDs, log probabilities and terminal reward.
 
@@ -80,8 +85,11 @@ duckdb:
     schema: main
 ```
 
-Use the DuckDB connector definition ID in your Airbyte workspace. Keep the
-Airbyte workspace and source settings in the installed development config.
+Use the DuckDB connector definition ID in your Airbyte workspace. For sources
+that emit global checkpoints, including MongoDB, build and register the
+patched connector at `runtime/airbyte-duckdb/Dockerfile`. Use that custom
+definition ID in both the public and installed configs. Keep the Airbyte
+workspace and source settings in the installed development config.
 Install the scoped workspace credentials and seed development data before
 running a probe. The public bundle contains task inputs and templates.
 
