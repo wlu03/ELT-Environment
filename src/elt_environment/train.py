@@ -19,6 +19,7 @@ from tinker_cookbook import cli_utils, model_info
 from tinker_cookbook.rl.train import Config, main
 
 from elt_environment.env import EltDatasetBuilder, RetryWholeGroup
+from elt_environment.progress import training_progress
 from elt_environment.runner import AgentConfig, preflight
 from elt_environment.tasks import discover_tasks
 
@@ -55,6 +56,7 @@ class CLIConfig:
     groups_per_batch: int = 8
     epochs: int = 4
     max_steps: int | None = None
+    progress_bar: bool = True
     max_tokens: int = 10240
     temperature: float = 1.0
     eval_families: int = 5
@@ -144,7 +146,8 @@ async def cli_main(cli: CLIConfig) -> None:
     config = build_config(cli)
     cli_utils.check_log_dir(config.log_path, behavior_if_exists=cli.behavior_if_log_dir_exists)
     logger.info("log path: %s", config.log_path)
-    await main(config)
+    with training_progress(cli.progress_bar):
+        await main(config)
 
 
 def agent_config(cli) -> AgentConfig:
