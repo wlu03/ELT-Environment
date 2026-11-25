@@ -37,6 +37,23 @@ def _reason_code(code: str) -> str:
     return code if _REASON_CODE.fullmatch(code) else "harness_fault"
 
 
+def _save_duckdb_diagnostics(stderr, path: Path, task_id: str) -> None:
+    try:
+        stderr.seek(0)
+        output = stderr.read(512 * 1024 + 1)
+        if not output:
+            return
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as log:
+            log.write(output[:512 * 1024])
+            if len(output) > 512 * 1024:
+                log.write(b"\n[grader diagnostics truncated]\n")
+        logger.info("DuckDB grading diagnostics for %s saved to %s", task_id, path)
+    except OSError:
+        logger.warning("Could not save DuckDB grading diagnostics for %s", task_id, exc_info=True)
+
+
 def grade_artifact(
     task: TaskRef, files: Mapping[str, str], config: GraderConfig, runtime: dict | None = None
 ) -> GraderOutcome:
@@ -78,6 +95,11 @@ def grade_artifact(
                     os.killpg(process.pid, signal.SIGKILL)
                     process.wait()
                     return DiscardGroup("grader_timeout")
+                finally:
+                    if task.destination == "duckdb":
+                        _save_duckdb_diagnostics(
+                            stderr, config.attempts_root / "diagnostics" / f"{root.name}.log", task.task_id,
+                        )
                 if process.returncode:
                     return DiscardGroup("grader_command_failed")
                 stdout.seek(0)
