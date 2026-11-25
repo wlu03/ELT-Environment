@@ -155,12 +155,19 @@ async def probe(config: ProbeConfig) -> dict:
             last = trajectory.transitions[-1]
             turns = []
             for transition in trajectory.transitions:
-                message, _ = renderer.parse_response(transition.ac.tokens)
+                truncated = bool(transition.metrics.get("output_truncated"))
+                if truncated:
+                    message, termination = None, "length"
+                else:
+                    parsed, termination = renderer.parse_response(transition.ac.tokens)
+                    message = renderer.to_openai_message(parsed)
                 turns.append(
                     {
-                        "message": renderer.to_openai_message(message),
+                        "message": message,
                         "tokens": transition.ac.tokens,
                         "logprobs": transition.ac.logprobs,
+                        "parse_termination": str(termination),
+                        "output_truncated": truncated,
                         "reward": transition.reward,
                     }
                 )
@@ -176,7 +183,7 @@ async def probe(config: ProbeConfig) -> dict:
     phases = collections.Counter(
         next(
             (k[len("phase_") :] for k, v in m.items() if k.startswith("phase_") and v == 1.0),
-            "format",
+            "policy" if m.get("policy_violation") else "format",
         )
         for m in all_metrics
     )
@@ -192,6 +199,10 @@ async def probe(config: ProbeConfig) -> dict:
         "full_reward_rate": sum(1 for r in scored for x in r["rewards"] if x == 1.0)
         / max(1, rollouts),
         "format_error_rate": sum(m.get("format_error", 0.0) for m in all_metrics)
+        / max(1, rollouts),
+        "output_truncation_rate": sum(m.get("output_truncated", 0.0) for m in all_metrics)
+        / max(1, rollouts),
+        "policy_violation_rate": sum(m.get("policy_violation", 0.0) for m in all_metrics)
         / max(1, rollouts),
         "first_failed_phase": dict(phases),
         "groups_with_reward_variance": sum(1 for r in scored if len(set(r["rewards"])) > 1),

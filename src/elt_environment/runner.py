@@ -202,7 +202,7 @@ def public_snapshot(root: Path) -> dict[str, str]:
     return snapshot
 
 
-def collect_artifact(workspace: Path) -> dict[str, str]:
+def collect_artifact(workspace: Path, dbt_project: Path | None = None) -> dict[str, str]:
     """Collect declarative source, excluding runtime caches and warehouse profiles.
 
     The existing private taskgen grader owns the allowed artifact surface and
@@ -213,28 +213,70 @@ def collect_artifact(workspace: Path) -> dict[str, str]:
         raise SubmissionViolation("artifact root symlink")
     files = {}
     total = 0
-    for parent, directories, names in os.walk(workspace / "elt", followlinks=False):
-        base = Path(parent)
-        for name in list(directories):
-            child = base / name
-            if child.is_symlink():
-                raise SubmissionViolation("artifact directory symlink")
-            if name in {".terraform", "target", "logs", "dbt_packages", "__pycache__"}:
-                directories.remove(name)
-        for name in names:
-            path = base / name
-            if not stat.S_ISREG(path.lstat().st_mode):
-                raise SubmissionViolation("artifact must contain regular files")
-            if name == "profiles.yml" or path.suffix not in {".tf", ".sql", ".yml", ".yaml"}:
-                continue
-            total += path.stat().st_size
-            if total > 4 * 1024 * 1024 or len(files) >= 512:
-                raise SubmissionViolation("artifact size limit")
-            try:
-                files[str(path.relative_to(workspace))] = path.read_text()
-            except UnicodeError as error:
-                raise SubmissionViolation("artifact is not UTF-8") from error
+    roots = [(workspace / "elt", Path("elt"))]
+    if dbt_project is not None:
+        roots.append((dbt_project, Path("elt") / dbt_project.name))
+    for root, destination in roots:
+        for parent, directories, names in os.walk(root, followlinks=False):
+            base = Path(parent)
+            for name in list(directories):
+                child = base / name
+                if child.is_symlink():
+                    raise SubmissionViolation("artifact directory symlink")
+                if name in {".terraform", "target", "logs", "dbt_packages", "__pycache__"}:
+                    directories.remove(name)
+            for name in names:
+                path = base / name
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    raise SubmissionViolation("artifact must contain regular files")
+                suffixes = {".sql", ".yml", ".yaml"}
+                if root != dbt_project:
+                    suffixes.add(".tf")
+                if name == "profiles.yml" or path.suffix not in suffixes:
+                    continue
+                relative = str(destination / path.relative_to(root))
+                if relative in files:
+                    raise SubmissionViolation("artifact path collision")
+                total += path.stat().st_size
+                if total > 4 * 1024 * 1024 or len(files) >= 512:
+                    raise SubmissionViolation("artifact size limit")
+                try:
+                    files[relative] = path.read_text()
+                except UnicodeError as error:
+                    raise SubmissionViolation("artifact is not UTF-8") from error
     return files
+
+
+def submission_artifact(workspace: Path, baseline: dict, *, swe: bool, duckdb: bool):
+    snapshot = public_snapshot(workspace)
+    added = snapshot.keys() - baseline.keys()
+    allowed = set()
+    project = None
+    if swe:
+        allowed.update(
+            path for path in added
+            if path in {"model.patch", ".user.yml"} or re.fullmatch(r"logs/dbt\.log(?:\.\d+)?", path)
+        )
+    if duckdb:
+        protected_roots = {Path(path).parts[0] for path in baseline} | {
+            "elt", "schemas", "documentation", "logs",
+        }
+        allowed.update(
+            path for path in added
+            if len(Path(path).parts) == 1 and Path(path).suffix == ".sql"
+        )
+        projects = [
+            Path(path).parent for path in sorted(added)
+            if len(Path(path).parts) == 2 and Path(path).name == "dbt_project.yml"
+            and Path(path).parts[0] not in protected_roots
+        ]
+        if len(projects) == 1:
+            candidate = projects[0]
+            project = workspace / candidate
+            allowed.update(path for path in added if Path(path).parts[0] == candidate.name)
+    if {path: digest for path, digest in snapshot.items() if path not in allowed} != baseline:
+        raise SubmissionViolation("public input changed")
+    return collect_artifact(workspace, project)
 
 
 class AgentSession:
@@ -345,9 +387,10 @@ class AgentSession:
             await asyncio.gather(pending, return_exceptions=True)
 
     def artifact(self):
-        if public_snapshot(self.workspace) != self.snapshot:
-            raise SubmissionViolation("public input changed")
-        return collect_artifact(self.workspace)
+        return submission_artifact(
+            self.workspace, self.snapshot,
+            swe=self.config.agent == "swe", duckdb=self.task.destination == "duckdb",
+        )
 
     def duckdb_replay_receipt(self) -> dict:
         from elt_taskgen.runtime.process_compliance import (
