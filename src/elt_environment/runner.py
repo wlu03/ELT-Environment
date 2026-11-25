@@ -6,6 +6,7 @@ import asyncio
 import fcntl
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -23,7 +24,10 @@ from pathlib import Path
 import yaml
 
 from elt_environment.bridge import Bridge
+from elt_environment.agent_worker import SWE_RUNTIME_FAILURES, SWE_STARTUP_FAILURES
 from elt_environment.duckdb_target import stage_duckdb_input, validate_duckdb_workspace
+
+logger = logging.getLogger(__name__)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 AGENTS = ("spider", "swe", "openhands", "codex", "claude")
@@ -54,10 +58,13 @@ class AgentConfig:
     image: str | None = None
     duckdb_local_root: str | None = None
     duckdb_control_port: int | None = None
+    agent_feedback: bool = False
     max_turns: int = 100
     max_tokens: int = 10240
     context_length: int = 65536
     timeout_s: float = 7200
+
+
     bridge_bind_host: str = "127.0.0.1"
     bridge_container_host: str = "host.docker.internal"
 
@@ -75,6 +82,7 @@ class AgentConfig:
 
 
 def worker_environment() -> dict[str, str]:
+
     names = (
         "PATH",
         "LANG",
@@ -161,6 +169,7 @@ def validate_input(config: AgentConfig, task):
     serialized = json.dumps(values)
     if "<" in serialized and ">" in serialized:
         raise ValueError(f"install runtime credentials before running {task.task_id}")
+
     for name in ("data_model.yaml", "schemas"):
         public = task.public_dir / name
         installed = source / name
@@ -261,6 +270,7 @@ def submission_artifact(workspace: Path, baseline: dict, *, swe: bool, duckdb: b
         protected_roots = {Path(path).parts[0] for path in baseline} | {
             "elt", "schemas", "documentation", "logs",
         }
+
         allowed.update(
             path for path in added
             if len(Path(path).parts) == 1 and Path(path).suffix == ".sql"
@@ -298,6 +308,8 @@ class AgentSession:
         validate_input(self.config, self.task)
         attempts = Path(self.config.attempts_root).resolve()
         attempts.mkdir(parents=True, exist_ok=True, mode=0o700)
+
+
         lock_path = Path(self.config.inputs_root).resolve() / ".tinker-runtime.lock"
         self.lock = lock_path.open("a")
         while True:
@@ -314,10 +326,12 @@ class AgentSession:
             self.duckdb_storage = Path(
                 tempfile.mkdtemp(prefix="elt-duckdb-", dir=duckdb_storage_root(self.config))
             )
+
             self.duckdb_storage.chmod(0o733)
             staged = self.root / "inputs"
             stage_duckdb_input(
-                inputs / self.task.task_id, staged / self.task.task_id, self.duckdb_storage
+                inputs / self.task.task_id, staged / self.task.task_id, self.duckdb_storage,
+                agent_feedback=self.config.agent_feedback,
             )
             inputs = staged
         self.snapshot = public_snapshot(inputs / self.task.task_id)
@@ -349,6 +363,7 @@ class AgentSession:
         spec_file.write_text(json.dumps(spec))
         spec_file.chmod(0o600)
         self.log = (self.root / "worker.log").open("wb")
+
         self.process = await asyncio.create_subprocess_exec(
             self.config.python,
             str(Path(__file__).with_name("agent_worker.py")),
@@ -377,14 +392,36 @@ class AgentSession:
             if self.bridge.failure in completed:
                 raise AgentFault(self.bridge.failure.result())
             if self.done in completed:
+                reason = self._swe_status("runtime_failure")
+                if reason in SWE_RUNTIME_FAILURES:
+                    raise AgentFault(reason)
                 if self.done.result() != 0:
-                    raise AgentFault("agent_worker_failed")
+                    logger.warning("Agent worker for %s exited with status %s. Private log at %s",
+                                   self.task.task_id, self.done.result(), self.root / "worker.log")
+                    reason = self._swe_status("startup_failure")
+                    raise AgentFault(reason if reason in SWE_STARTUP_FAILURES else "agent_worker_failed")
                 return None
             return pending.result()
         finally:
             if not pending.done():
                 pending.cancel()
             await asyncio.gather(pending, return_exceptions=True)
+
+    def _swe_status(self, field: str) -> str | None:
+        if self.config.agent != "swe" or self.root is None:
+            return None
+        try:
+            data = json.loads((self.root / "result.json").read_text())
+        except (OSError, ValueError):
+            return None
+        value = data.get(field) if isinstance(data, dict) else None
+        return value if isinstance(value, str) else None
+
+    def swe_exit_status(self) -> str | None:
+        status = self._swe_status("exit_status")
+        if status and re.fullmatch(r"[a-z_]{1,40}|submitted \([a-z_]{1,40}\)", status):
+            return status
+        return None
 
     def artifact(self):
         return submission_artifact(
@@ -422,6 +459,7 @@ class AgentSession:
             except ProcessLookupError:
                 pass
         if self.container_name:
+
             process = await asyncio.create_subprocess_exec(
                 "docker",
                 "rm",
@@ -437,6 +475,8 @@ class AgentSession:
                 await process.wait()
                 raise AgentFault("container_cleanup_failed")
             if process.returncode != 0:
+
+
                 check = await asyncio.create_subprocess_exec(
                     "docker",
                     "ps",

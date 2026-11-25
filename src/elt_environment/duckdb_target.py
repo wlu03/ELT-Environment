@@ -43,15 +43,25 @@ def validate_duckdb_workspace(document: dict) -> None:
         raise ValueError("install a scoped Airbyte development workspace for this DuckDB task")
 
 
-def stage_duckdb_input(source: Path, target: Path, storage: Path) -> None:
+def duckdb_destination_path(storage: Path, directory: str = "/local") -> str:
+    if not isinstance(directory, str) or not re.fullmatch(r"/local(?:/[a-zA-Z0-9_-]+)*", directory):
+        raise ValueError("DuckDB Airbyte storage must be in /local")
+    return f"{directory}/{storage.name}/warehouse.duckdb"
+
+
+def stage_duckdb_input(source: Path, target: Path, storage: Path, *, agent_feedback=False) -> None:
     """Give Airbyte and dbt two container paths to the same attempt file."""
     document = yaml.safe_load((source / "config.yaml").read_text())
     connector = duckdb_config(document)
-    connector["destination_path"] = f"/local/{storage.name}/warehouse.duckdb"
+    connector["destination_path"] = duckdb_destination_path(
+        storage, document["duckdb"]["config"].get("airbyte_directory", "/local"),
+    )
     document["duckdb"]["config"] = connector
     shutil.copytree(source, target, ignore=shutil.ignore_patterns("*_credential.json"))
     (target / "config.yaml").write_text(yaml.safe_dump(document, sort_keys=False))
     (target / "profiles.yml").write_text(yaml.safe_dump(duckdb_profile()))
+    if agent_feedback:
+        shutil.copyfile(Path(__file__).with_name("development_preflight.py"), target / "check_streams.py")
 
 
 def duckdb_profile() -> dict:

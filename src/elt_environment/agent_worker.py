@@ -27,6 +27,61 @@ FOLDERS = {
     "openhands": "openhands",
 }
 
+SWE_STARTUP_FAILURES = frozenset({
+    "swe_rex_docker_start_failed",
+    "swe_rex_container_unavailable",
+    "swe_rex_relay_unavailable",
+})
+SWE_SHELL_RECOVERY_FAILED = "swe_shell_recovery_failed"
+SWE_TOOL_STATE_FAILED = "swe_tool_state_failed"
+SWE_RUNTIME_FAILURES = frozenset({SWE_SHELL_RECOVERY_FAILED, SWE_TOOL_STATE_FAILED})
+
+
+class SWEStartupError(RuntimeError):
+    pass
+
+
+def write_swe_status(spec: dict, **status) -> None:
+    target = Path(spec["result_file"])
+    temporary = target.with_suffix(".tmp")
+    temporary.touch(mode=0o600)
+    temporary.write_text(json.dumps(status))
+    temporary.replace(target)
+
+
+def recover_swe_shell(interrupt, communicate) -> None:
+    """Wait for the interrupted shell to acknowledge a fresh command."""
+    interrupt()
+    for _ in range(2):
+        marker = secrets.token_hex(16)
+        output = communicate(
+            f"printf '\\n%s%s\\n' '{marker[:16]}' '{marker[16:]}'", timeout=5, check="warn",
+        )
+        if marker in output.splitlines():
+            return
+    raise RuntimeError(SWE_SHELL_RECOVERY_FAILED)
+
+
+def read_swe_tool_state(state_command: str, communicate) -> dict:
+    """Read a JSON state record even when a background job writes to the terminal."""
+    for _ in range(2):
+        marker = secrets.token_hex(16)
+        output = communicate(
+            "printf '\\n%s%s%s%s%s\\n' "
+            f"'SWE_STATE_BEGIN' '{marker}' \"$({state_command})\" 'SWE_STATE_END' '{marker}'",
+            check="warn",
+        )
+        _, start, rest = output.partition("SWE_STATE_BEGIN" + marker)
+        payload, end, _ = rest.partition("SWE_STATE_END" + marker)
+        if start and end:
+            try:
+                state = json.loads(payload)
+            except ValueError:
+                continue
+            if isinstance(state, dict):
+                return state
+    raise RuntimeError(SWE_TOOL_STATE_FAILED)
+
 
 def load(path: Path):
     spec = importlib.util.spec_from_file_location("elt_vendored_runner", path)
@@ -37,6 +92,8 @@ def load(path: Path):
 
 
 def run_spider(spec: dict, root: Path):
+
+
     module = types.ModuleType("spider_agent.agent.models")
 
     def call_llm(body):
@@ -63,6 +120,7 @@ def run_spider(spec: dict, root: Path):
         public_input,
         ignore=shutil.ignore_patterns("*_credential.json"),
     )
+
     instruction = (
         "You are required to build an ELT pipeline by extracting data from multiple sources, "
         "such as custom APIs, Postgres, MongoDB, flat files and cloud service S3. The extracted "
@@ -107,6 +165,7 @@ def run_swe(spec: dict, root: Path):
     sys.path.insert(0, str(root / "SWE-agent"))
     upstream = load(root / "SWE-agent/run_elt.py")
     from common import prepare_destination
+    from sweagent.run.hooks.abstract import RunHook
     from sweagent.run.run_single import RunSingle, RunSingleConfig
 
     inputs = Path(spec["inputs_root"]) / spec["task_id"]
@@ -137,6 +196,20 @@ Keep the dbt project in /workspace/elt or in a new directory directly under
 /workspace. Set profile: elt_environment in dbt_project.yml and pass
 --profiles-dir /workspace to dbt. The installed profile writes to elt_models.
 """
+        if spec.get("agent_feedback"):
+            config["agent"]["templates"]["instance_template"] += """
+After applying Terraform, run python /workspace/check_streams.py to check whether
+all streams listed in config.yaml are present in the applied connections.
+"""
+    if spec.get("agent_feedback"):
+        from sweagent.tools.parsing import FunctionCallingParser
+
+        parser = config["agent"]["tools"]["parse_function"]
+        parser["error_message"] = parser.get("error_message", FunctionCallingParser().error_message) + """
+Send one tool call per turn, using only its advertised arguments.
+The bash tool takes command only. To edit a file, call open with its path first,
+then call edit with search, replace, and replace-all.
+"""
     config.setdefault("agent", {})["model"] = {
         "name": "openai/gpt-4.1",
         "api_base": spec["host_url"],
@@ -147,7 +220,11 @@ Keep the dbt project in /workspace/elt or in a new directory directly under
     }
     deployment = {"type": "docker", "image": spec["image"], "docker_args": docker_args}
     if duckdb and spec.get("duckdb_control_port"):
-        deployment = start_private_swe(spec, docker_args)
+        try:
+            deployment = start_private_swe(spec, docker_args)
+        except SWEStartupError as failure:
+            write_swe_status(spec, startup_failure=str(failure))
+            raise
     config["env"] = {
         "repo": {"type": "preexisting", "repo_name": "workspace"},
         "deployment": deployment,
@@ -158,7 +235,44 @@ Keep the dbt project in /workspace/elt or in a new directory directly under
     empty_env.touch()
     config["env_var_path"] = str(empty_env)
     os.chdir(root / "SWE-agent")
+
+
     run = RunSingle.from_config(RunSingleConfig.model_validate(config))
+    runtime_failure = None
+
+    def record_runtime_failure(reason):
+        nonlocal runtime_failure
+        if runtime_failure is None:
+            runtime_failure = reason
+            write_swe_status(spec, runtime_failure=reason)
+
+    if duckdb:
+        upstream_interrupt = run.env.interrupt_session
+
+        def interrupt_session():
+            try:
+                recover_swe_shell(upstream_interrupt, run.env.communicate)
+            except Exception:
+                record_runtime_failure(SWE_SHELL_RECOVERY_FAILED)
+                raise
+
+        def get_tool_state(state_command, env):
+            try:
+                return read_swe_tool_state(state_command, env.communicate)
+            except Exception:
+                record_runtime_failure(SWE_TOOL_STATE_FAILED)
+                raise
+
+        run.env.interrupt_session = interrupt_session
+        run.agent.tools._get_state = get_tool_state
+
+    class ExitStatusHook(RunHook):
+        def on_instance_completed(self, *, result):
+            write_swe_status(spec, exit_status=result.info.get("exit_status"), runtime_failure=runtime_failure)
+
+    run.add_hook(ExitStatusHook())
+
+
     if deployment["type"] == "docker":
         run.env.deployment._get_container_name = lambda: spec["container_name"]
     try:
@@ -183,9 +297,12 @@ def start_private_swe(spec: dict, docker_args: list[str]) -> dict:
     request = urllib.request.Request(f"{host}:{port}/is_alive", headers={"X-API-Key": token})
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     for _ in range(2):
-        result = subprocess.run(command, capture_output=True, timeout=45)
+        try:
+            result = subprocess.run(command, capture_output=True, timeout=45)
+        except (OSError, subprocess.TimeoutExpired):
+            raise SWEStartupError("swe_rex_docker_start_failed") from None
         if result.returncode:
-            raise RuntimeError(f"could not start private SWE-ReX (Docker exit {result.returncode})")
+            raise SWEStartupError("swe_rex_docker_start_failed")
         deadline = time.monotonic() + 45
         while time.monotonic() < deadline:
             try:
@@ -196,8 +313,30 @@ def start_private_swe(spec: dict, docker_args: list[str]) -> dict:
             except OSError:
                 pass
             time.sleep(0.5)
+        failure = (
+            "swe_rex_relay_unavailable" if local_swe_is_ready(name, token)
+            else "swe_rex_container_unavailable"
+        )
         subprocess.run(["docker", "rm", "-f", name], capture_output=True, timeout=20)
-    raise RuntimeError("private SWE-ReX did not become ready after two starts")
+    raise SWEStartupError(failure)
+
+
+def local_swe_is_ready(name: str, token: str) -> bool:
+    script = """
+import sys
+from urllib.request import Request, urlopen
+request = Request("http://127.0.0.1:8000/is_alive", headers={"X-API-Key": sys.stdin.read()})
+with urlopen(request, timeout=2) as response:
+    sys.exit(response.status != 200)
+"""
+    try:
+        result = subprocess.run(
+            ["docker", "exec", "-i", name, "python", "-c", script],
+            input=token.encode(), capture_output=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 async def run_sdk(spec: dict, root: Path):
@@ -238,6 +377,7 @@ async def run_sdk(spec: dict, root: Path):
     out_dir = Path(spec["workspace"])
     out_dir.mkdir(parents=True, exist_ok=True)
     result = out_dir / (agent if agent != "codex" else "codex") / "result.json"
+
     await upstream._run_task_body(
         db=spec["task_id"],
         destination=spec["destination"],
@@ -248,8 +388,11 @@ async def run_sdk(spec: dict, root: Path):
         result_path=result,
         inputs_root=Path(spec["inputs_root"]),
         model=model,
+
+
         max_turns=spec["max_turns"] + 1,
     )
+
     result_data = json.loads(result.read_text())
     Path(spec["result_file"]).write_text(json.dumps(result_data))
     if not result_data.get("finished", False):

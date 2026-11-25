@@ -126,6 +126,7 @@ class EltEnv(Env):
         with logtree.scope_header("Policy Response"):
             logtree.log_formatter(ConversationFormatter(messages=[message]))
         if message.get("unparsed_tool_calls") or not termination.is_clean:
+
             if stop_reason is None and len(action) >= self.agent.max_tokens:
                 return await self._grade_workspace(budget=True, truncated=True)
             return self._final(0.0, {"format_error": 1.0, "model_calls": float(self.turns)})
@@ -165,7 +166,11 @@ class EltEnv(Env):
             "output_truncated": float(truncated),
         }
         try:
+
+
             await self.session.stop_worker()
+            if self.agent.agent == "swe" and (status := self.session.swe_exit_status()):
+                metrics[f"solver_exit_status/{status}"] = 1.0
             try:
                 files = self.session.artifact()
             except SubmissionViolation:
@@ -177,6 +182,8 @@ class EltEnv(Env):
             try:
                 outcome = await asyncio.shield(grading)
             except asyncio.CancelledError:
+
+
                 await grading
                 raise
             reward = require_tinker_reward(outcome)
@@ -213,6 +220,10 @@ class EltGroupBuilder(EnvGroupBuilder):
 
 class GroupRetryExhausted(RuntimeError):
     """Every attempt at a group had at least one rollout without a label."""
+
+    def __init__(self, message: str, *, reason_codes: tuple[str, ...] = ()):
+        super().__init__(message)
+        self.reason_codes = reason_codes
 
 
 @dataclass(frozen=True)
@@ -269,9 +280,11 @@ class RetryWholeGroup(RolloutStrategy):
                 )
                 continue
             return RolloutResult(trajectories=list(results), envs=envs, errors=errors)
+        reason_codes = tuple(error.error_message for error in errors)
         raise GroupRetryExhausted(
             f"{self.max_attempts} attempts each had a rollout without a label: "
-            + ", ".join(error.error_message for error in errors)
+            + ", ".join(reason_codes),
+            reason_codes=reason_codes,
         )
 
 

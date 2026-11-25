@@ -62,10 +62,12 @@ class ProbeConfig:
     agent_image: str | None = None
     duckdb_local_root: str | None = None
     duckdb_control_port: int | None = None
+    agent_feedback: bool = False
     agent_network: str = "elt-docker_elt_network"
     bridge_bind_host: str = "127.0.0.1"
     bridge_container_host: str = "host.docker.internal"
     grader_command: str = ""
+    grader_deadline_s: float | None = None
     model_name: str = DEFAULT_MODEL
     model_path: str | None = None
     renderer_name: str | None = None
@@ -104,6 +106,14 @@ def choose_tasks(train: Sequence[TaskRef], count: int, task_ids: str | None) -> 
     return chosen
 
 
+def solver_exit_status(metrics: dict) -> str | None:
+    return next(
+        (key.split("/", 1)[1] for key, value in metrics.items()
+         if key.startswith("solver_exit_status/") and value == 1.0),
+        None,
+    )
+
+
 async def probe(config: ProbeConfig) -> dict:
     """Grade ``samples`` agent attempts per chosen task and summarize rewards."""
 
@@ -124,6 +134,7 @@ async def probe(config: ProbeConfig) -> dict:
     grader = GraderConfig(
         attempts_root=STATE_ROOT / "attempts",
         command=tuple(shlex.split(config.grader_command)),
+        grader_deadline_s=config.grader_deadline_s,
     )
     service = tinker.ServiceClient()
     sampling = await service.create_sampling_client_async(
@@ -147,7 +158,8 @@ async def probe(config: ProbeConfig) -> dict:
         try:
             group = await do_group_rollout(builder, policy, strategy=strategy)
         except GroupRetryExhausted as error:
-            return {"task_id": task.task_id, "discarded": str(error)}
+            return {"task_id": task.task_id, "discarded": str(error),
+                    "discard_reasons": list(error.reason_codes)}
         task_dir = out_dir / task.task_id
         task_dir.mkdir(parents=True, exist_ok=True)
         rewards, metrics = [], []
@@ -179,6 +191,7 @@ async def probe(config: ProbeConfig) -> dict:
     results = await asyncio.gather(*(one(task) for task in chosen))
     scored = [r for r in results if "rewards" in r]
     all_metrics = [m for r in scored for m in r["metrics"]]
+    exit_statuses = {r["task_id"]: [solver_exit_status(m) for m in r["metrics"]] for r in scored}
     rollouts = len(all_metrics)
     phases = collections.Counter(
         next(
@@ -207,6 +220,13 @@ async def probe(config: ProbeConfig) -> dict:
         "first_failed_phase": dict(phases),
         "groups_with_reward_variance": sum(1 for r in scored if len(set(r["rewards"])) > 1),
         "groups_discarded": len(results) - len(scored),
+        "discard_reasons_by_task": {
+            r["task_id"]: r["discard_reasons"] for r in results if "discard_reasons" in r
+        },
+        "solver_exit_status_by_task": exit_statuses,
+        "solver_exit_status_counts": dict(collections.Counter(
+            status for statuses in exit_statuses.values() for status in statuses if status
+        )),
         "per_task": {r["task_id"]: r.get("rewards", r.get("discarded")) for r in results},
         "metrics_by_task": {r["task_id"]: r["metrics"] for r in scored},
         "replies": str(out_dir),
