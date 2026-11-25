@@ -2,6 +2,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,13 +11,19 @@ from unittest.mock import Mock, patch
 import yaml
 from task_fixtures import write_bundle
 
-from elt_environment.duckdb_grader import stage_submission
+from elt_environment.duckdb_grader import (
+    DbtReplayError, invalid_s3_stream, missing_required_streams, run_dbt, stage_submission,
+)
 from elt_environment.duckdb_target import stage_duckdb_input
+from elt_environment.grading import GraderConfig, grade_artifact
+from elt_environment.outcomes import DiscardGroup
 from elt_environment.runner import (
     AgentConfig, AgentSession, SubmissionViolation, agent_image, public_snapshot,
     submission_artifact, validate_input,
 )
 from elt_environment.tasks import discover_tasks
+from elt_taskgen.runtime.airbyte import AirbyteSyncFailure
+from elt_taskgen.runtime.source_environment import SourceEnvironment
 
 
 CONNECTOR = "457da65e-d465-4e75-8afd-2ad38ed7ed0e"
@@ -36,6 +43,64 @@ def duckdb_task(bundle: Path) -> Path:
 
 
 class DuckDBTargetTests(unittest.TestCase):
+    def test_hidden_dbt_preserves_model_failures_and_flags_runtime_failures(self):
+        for returncode, event, data, status in (
+            (0, None, {}, "success"),
+            (1, "RunResultError", {"msg": "Catalog Error: table is missing"}, "model_error"),
+            (2, "MainEncounteredError", {"exc": "Compilation Error\n  Invalid ref"}, "project_error"),
+            (2, "MainEncounteredError", {"exc": "Runtime Error\n  Could not find profile named 'bad'"},
+             "project_error"),
+            (1, "RunResultError", {"msg": "IO Error: Could not set lock on file"}, "grader_error"),
+            (2, "MainEncounteredError", {"exc": 'IO Error: could not read "/duckdb/warehouse.duckdb"'},
+             "grader_error"),
+            (137, None, {}, "grader_error"),
+        ):
+            with self.subTest(returncode=returncode, status=status):
+                stdout = json.dumps({"info": {"level": "error", "name": event}, "data": data}) if event else ""
+                result = subprocess.CompletedProcess([], returncode, stdout, "")
+                with patch("elt_environment.duckdb_grader.sandbox", return_value=result), patch(
+                    "elt_environment.duckdb_grader.sys.stderr"
+                ) as stderr:
+                    root = Path("/tmp/submission")
+                    if status == "grader_error":
+                        with self.assertRaises(DbtReplayError):
+                            run_dbt(Path("/tmp/db"), root, root / "elt", "primary")
+                    else:
+                        run_dbt(Path("/tmp/db"), root, root / "elt", "primary")
+                log = json.loads(stderr.write.call_args_list[0].args[0])
+                self.assertEqual(log["status"], status)
+                self.assertEqual(log["population"], "primary")
+                self.assertEqual(log["stdout"], stdout)
+
+    def test_hidden_dbt_timeout_makes_replay_unscorable_and_keeps_output(self):
+        timeout = subprocess.TimeoutExpired(["dbt"], 240, output=b"dbt startup")
+        with patch("elt_environment.duckdb_grader.sandbox", side_effect=timeout), patch(
+            "elt_environment.duckdb_grader.sys.stderr"
+        ) as stderr:
+            root = Path("/tmp/submission")
+            with self.assertRaises(DbtReplayError):
+                run_dbt(Path("/tmp/db"), root, root / "elt", "stress")
+        log = json.loads(stderr.write.call_args_list[0].args[0])
+        self.assertEqual(log["status"], "grader_error")
+        self.assertEqual(log["stdout"], "dbt startup")
+
+    def test_hidden_dbt_diagnostics_survive_grading_without_leaving_private_requests(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            duckdb_task(root / "bundle")
+            task, = discover_tasks(root / "bundle")
+            response = json.dumps({"label_valid": False, "reason_code": "duckdb_dbt_replay_failed"})
+            config = GraderConfig(root / "attempts", (
+                sys.executable, "-c",
+                "import sys; print('private dbt error', file=sys.stderr); "
+                f"print({response!r})",
+            ))
+            self.assertEqual(grade_artifact(task, {}, config), DiscardGroup("duckdb_dbt_replay_failed"))
+            log, = (config.attempts_root / "diagnostics").iterdir()
+            self.assertEqual(log.read_text(), "private dbt error\n")
+            self.assertEqual(stat.S_IMODE(log.stat().st_mode), 0o600)
+            self.assertEqual(list(config.attempts_root.iterdir()), [log.parent])
+
     def test_discover_and_validate_swe_task(self):
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)
@@ -153,6 +218,54 @@ class DuckDBTargetTests(unittest.TestCase):
             public_sql.write_text("select 2\n")
             with self.assertRaisesRegex(SubmissionViolation, "public input changed"):
                 submission_artifact(root, baseline, swe=True, duckdb=True)
+
+    def test_missing_streams_require_complete_airbyte_metadata(self):
+        required = {"public_users", "public_events"}
+        configured = {
+            "connectionId": "one", "prefix": "public_",
+            "configurations": {"streams": [{"name": "Users"}]},
+        }
+        empty = {"connectionId": "two", "configurations": {"streams": []}}
+        unknown = {"connectionId": "two"}
+        self.assertEqual(missing_required_streams(required, [configured, empty]), {"public_events"})
+        self.assertIsNone(missing_required_streams(required, [configured, unknown]))
+        self.assertEqual(missing_required_streams({"public_users"}, [configured, empty]), set())
+
+    def test_s3_replay_error_requires_a_selected_missing_literal(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            (root / "parts").mkdir()
+            (root / "parts/part-00000.jsonl").write_text("{}\n")
+            (root / "mirror.parquet").touch()
+            manifest = root / "manifest.json"
+            manifest.write_text(json.dumps({"tables": {
+                "users": {"backend": "s3", "bucket": "fixture", "rendered_dir": "parts",
+                          "object_key": "users.jsonl"},
+                "mirror": {"backend": "files", "rendered_file": "mirror.parquet"},
+            }}))
+            hidden = SourceEnvironment(
+                root, "task", "primary", root, root, manifest, root / "compose.yaml", "task", "net",
+            )
+            error = AirbyteSyncFailure("connection", 100, "failed")
+            failure = {
+                "failureOrigin": "source", "failureType": "config_error",
+                "internalMessage": "No files were identified in the stream",
+            }
+            connection = {"sourceId": "source", "configurations": {"streams": [{"name": "users"}]}}
+            for glob, expected in (
+                ("wrong.jsonl", True), ("users.jsonl", False), ("mirror.parquet", False),
+                ("**/wrong.jsonl", False),
+            ):
+                with self.subTest(glob=glob):
+                    client = Mock()
+                    client.request.side_effect = [
+                        {"attempts": [{"attempt": {"failureSummary": {"failures": [failure]}}}]},
+                        connection,
+                        {"configuration": {"bucket": "fixture",
+                                           "streams": [{"name": "users", "globs": [glob]}]}},
+                    ]
+                    self.assertEqual(invalid_s3_stream(client, error, hidden), expected)
+
 
 class DuckDBSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_duckdb_session_passes_attempt_storage_to_worker_and_cleans_it(self):

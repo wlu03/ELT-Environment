@@ -117,11 +117,17 @@ class EltEnv(Env):
         )
 
     async def step(self, action: Action, *, extra: ActionExtra | None = None) -> StepResult:
-        message, termination = self.renderer.parse_response(action)
         self.turns += 1
+        stop_reason = (extra or {}).get("stop_reason")
+        if stop_reason == "length":
+            return await self._grade_workspace(budget=True, truncated=True)
+
+        message, termination = self.renderer.parse_response(action)
         with logtree.scope_header("Policy Response"):
             logtree.log_formatter(ConversationFormatter(messages=[message]))
         if message.get("unparsed_tool_calls") or not termination.is_clean:
+            if stop_reason is None and len(action) >= self.agent.max_tokens:
+                return await self._grade_workspace(budget=True, truncated=True)
             return self._final(0.0, {"format_error": 1.0, "model_calls": float(self.turns)})
         try:
             reply = completion(
@@ -147,11 +153,23 @@ class EltEnv(Env):
                     next_stop_condition=self.stop_condition,
                     metrics={},
                 )
+            return await self._grade_workspace(budget=budget)
+        except AgentFault as error:
+            raise DiscardGroupSignal(str(error)) from error
+
+    async def _grade_workspace(self, *, budget: bool, truncated: bool = False) -> StepResult:
+        metrics = {
+            "format_error": 0.0,
+            "model_calls": float(self.turns),
+            "agent_budget_exhausted": float(budget),
+            "output_truncated": float(truncated),
+        }
+        try:
             await self.session.stop_worker()
             try:
                 files = self.session.artifact()
             except SubmissionViolation:
-                return self._final(0.0, {"policy_violation": 1.0, "model_calls": float(self.turns)})
+                return self._final(0.0, {**metrics, "policy_violation": 1.0})
             grader_args = (self.task, files, self.grader, self.grader_concurrency)
             if self.task.destination == "duckdb":
                 grader_args += (self.session.duckdb_replay_receipt(),)
@@ -162,15 +180,7 @@ class EltEnv(Env):
                 await grading
                 raise
             reward = require_tinker_reward(outcome)
-            return self._final(
-                reward,
-                {
-                    "format_error": 0.0,
-                    "model_calls": float(self.turns),
-                    "agent_budget_exhausted": float(budget),
-                    **outcome.metrics,
-                },
-            )
+            return self._final(reward, {**metrics, **outcome.metrics})
         except AgentFault as error:
             raise DiscardGroupSignal(str(error)) from error
 

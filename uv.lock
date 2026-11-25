@@ -353,6 +353,7 @@ dependencies = [
     { name = "pyyaml" },
     { name = "tinker" },
     { name = "tinker-cookbook" },
+    { name = "tqdm" },
 ]
 
 [package.optional-dependencies]
@@ -368,6 +369,7 @@ requires-dist = [
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.12,<1" },
     { name = "tinker", specifier = "==0.27.1" },
     { name = "tinker-cookbook", specifier = "==0.5.7" },
+    { name = "tqdm", specifier = ">=4.67,<5" },
 ]
 provides-extras = ["dev"]
 
